@@ -286,6 +286,11 @@ copy_selinux_context() {
 bind_fake_value() {
     local target="$1" source_name="$2" value="$3" real source readback
     [ -e "$target" ] || return 1
+
+    case "$source_name" in
+        *..* | */* ) log ERROR "非法 source_name: $source_name"; return 1 ;;
+    esac
+
     real="$(readlink -f "$target" 2>/dev/null)"
     [ -n "$real" ] || real="$target"
 
@@ -370,11 +375,7 @@ write_shell_temp() {
     local value="$1" i=0
     [ -w /proc/shell-temp ] || return 1
     while [ "$i" -le 7 ]; do
-        if [ "$i" -eq 0 ]; then
-            printf '%s %s\n' "$i" "$value" > /proc/shell-temp 2>/dev/null
-        else
-            printf '%s %s\n' "$i" "$value" >> /proc/shell-temp 2>/dev/null
-        fi
+        printf '%s %s\n' "$i" "$value" > /proc/shell-temp 2>/dev/null
         i=$((i + 1))
     done
 }
@@ -562,9 +563,23 @@ restore_runtime() {
 }
 
 acquire_lock() {
-    mkdir "$LOCK_DIR" 2>/dev/null
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo $$ > "$LOCK_DIR/pid" 2>/dev/null
+        return 0
+    fi
+    # 锁已存在，检查持有者是否还活着
+    local old_pid
+    old_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+        log WARN "清理陈旧锁（pid=$old_pid 已不存在）"
+        rm -rf "$LOCK_DIR" 2>/dev/null
+        mkdir "$LOCK_DIR" 2>/dev/null || return 1
+        echo $$ > "$LOCK_DIR/pid" 2>/dev/null
+        return 0
+    fi
+    return 1
 }
 
 release_lock() {
-    rmdir "$LOCK_DIR" 2>/dev/null
+    rm -rf "$LOCK_DIR" 2>/dev/null
 }
