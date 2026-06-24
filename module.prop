@@ -1,0 +1,7 @@
+id=PFFM20FullTempSpoof
+name=PFFM20 Full Temperature Spoof
+version=1.0.0
+versionCode=10000
+author=Codex + zhangzhengwei
+description=PFFM20/MT6983专用：按类别一次性伪装全部温度节点；保留内核soc_max临界保护；不改XML、thermal.conf、CPU频率和cooling device。
+
