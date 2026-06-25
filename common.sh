@@ -41,11 +41,6 @@ log() {
 
 load_config() {
     MASTER_ENABLE=1
-    STRICT_DEVICE_CHECK=1
-    EXPECTED_MODEL=PFFM20
-    EXPECTED_PLATFORM=mt6983
-    EXPECTED_ANDROID=12
-    EXPECTED_KERNEL_PREFIX=5.10.66
     WAIT_TIMEOUT_SEC=120
     EXPECTED_MIN_THERMAL_ZONES=51
 
@@ -96,7 +91,7 @@ is_uint_range() {
 
 validate_config() {
     local key value
-    for key in MASTER_ENABLE STRICT_DEVICE_CHECK CPU_ENABLE GPU_ENABLE \
+    for key in MASTER_ENABLE CPU_ENABLE GPU_ENABLE \
         APU_NPU_ENABLE MEMORY_ENABLE SOC_ENABLE SHELL_SKIN_ENABLE \
         BATTERY_ENABLE CHARGER_ENABLE PMIC_ENABLE MODEM_RF_ENABLE \
         CONNECTIVITY_ENABLE NTC_AMBIENT_ENABLE UNKNOWN_ENABLE \
@@ -137,37 +132,6 @@ validate_config() {
             return 1
         }
     fi
-    return 0
-}
-
-device_guard() {
-    [ "$STRICT_DEVICE_CHECK" = 1 ] || return 0
-
-    local model platform android kernel
-    model="$(getprop ro.product.model)"
-    platform="$(getprop ro.board.platform)"
-    [ -n "$platform" ] || platform="$(getprop ro.hardware)"
-    android="$(getprop ro.build.version.release)"
-    kernel="$(uname -r)"
-
-    [ "$model" = "$EXPECTED_MODEL" ] || {
-        log ERROR "设备不匹配：model=$model，期望 $EXPECTED_MODEL"
-        return 1
-    }
-    [ "$platform" = "$EXPECTED_PLATFORM" ] || {
-        log ERROR "平台不匹配：platform=$platform，期望 $EXPECTED_PLATFORM"
-        return 1
-    }
-    [ "$android" = "$EXPECTED_ANDROID" ] || {
-        log ERROR "Android 不匹配：release=$android，期望 $EXPECTED_ANDROID"
-        return 1
-    }
-    case "$kernel" in
-        "$EXPECTED_KERNEL_PREFIX"*) ;;
-        *) log ERROR "内核不匹配：kernel=$kernel，期望前缀 $EXPECTED_KERNEL_PREFIX"; return 1 ;;
-    esac
-
-    log INFO "设备校验通过：$model / $platform / Android $android / $kernel"
     return 0
 }
 
@@ -216,7 +180,11 @@ wait_for_thermal_zones() {
         sleep 1
         elapsed=$((elapsed + 1))
     done
-    log ERROR "等待 thermal zone 超时：仅发现 $count 个，期望至少 $EXPECTED_MIN_THERMAL_ZONES 个"
+    if [ "$count" -gt 0 ]; then
+        log WARN "等待 thermal zone 超时：仅发现 $count 个，期望至少 $EXPECTED_MIN_THERMAL_ZONES 个；继续按已发现节点应用"
+        return 0
+    fi
+    log ERROR "等待 thermal zone 超时：未发现可用 thermal zone"
     return 1
 }
 
@@ -412,17 +380,12 @@ runtime_tracked_mountpoints() {
 }
 
 runtime_mounts_complete() {
-    local target source target_value source_value target_context source_context expected mounted
-    local count=0 expected_count=0 failed=0
+    local target source target_value source_value target_context source_context mounted
+    local count=0 failed=0
     [ -s "$MOUNTS_FILE" ] || return 1
     is_exact_mountpoint "$THERM_FAKE_ROOT" || return 1
     is_exact_mountpoint "$BATTERY_SUPPLY_FAKE_ROOT" || return 1
     is_exact_mountpoint "$BATTERY_INFO_FAKE_ROOT" || return 1
-
-    for expected in $(expected_runtime_targets); do
-        expected_count=$((expected_count + 1))
-        mount_record_has_target "$expected" || failed=1
-    done
 
     for mounted in $(runtime_tracked_mountpoints); do
         mount_record_has_target "$mounted" || failed=1
@@ -450,7 +413,7 @@ runtime_mounts_complete() {
         [ -n "$source_context" ] && [ "$target_context" = "$source_context" ] || failed=1
     done < "$MOUNTS_FILE"
 
-    [ "$count" -gt 0 ] && [ "$count" -eq "$expected_count" ] && [ "$failed" -eq 0 ]
+    [ "$count" -gt 0 ] && [ "$failed" -eq 0 ]
 }
 
 thermal_target_mounts_present() {
@@ -574,7 +537,12 @@ apply_thermal_zones() {
     done
 
     log INFO "thermal zone 应用完成：mounted=$mounted skipped=$skipped failed=$failed"
-    [ "$failed" -eq 0 ]
+    if [ "$mounted" -gt 0 ]; then
+        [ "$failed" -eq 0 ] || log WARN "部分 thermal zone 未能伪装，已继续保留成功挂载的节点"
+        return 0
+    fi
+    log ERROR "没有任何 thermal zone 成功伪装"
+    return 1
 }
 
 apply_power_supply_battery() {
@@ -717,6 +685,15 @@ backup_runtime_state() {
 
 stop_init_service() {
     local service="$1" state tries=0
+    state="$(getprop init.svc."$service" 2>/dev/null)"
+    [ -n "$state" ] || {
+        log WARN "服务 $service 不存在，跳过停止"
+        return 0
+    }
+    [ "$state" = stopped ] && {
+        log INFO "服务 $service 已是停止状态"
+        return 0
+    }
     setprop ctl.stop "$service" 2>/dev/null
     while [ "$tries" -lt 5 ]; do
         sleep 1
@@ -733,6 +710,15 @@ stop_init_service() {
 
 start_init_service() {
     local service="$1" state tries=0
+    state="$(getprop init.svc."$service" 2>/dev/null)"
+    [ -n "$state" ] || {
+        log WARN "服务 $service 不存在，跳过启动"
+        return 0
+    }
+    [ "$state" = running ] && {
+        log INFO "服务 $service 已是运行状态"
+        return 0
+    }
     setprop ctl.start "$service" 2>/dev/null
     while [ "$tries" -lt 5 ]; do
         sleep 1
@@ -749,12 +735,21 @@ start_init_service() {
 
 restart_init_service() {
     local service="$1" before_pid after_pid state tries=0
+    state="$(getprop init.svc."$service" 2>/dev/null)"
+    [ -n "$state" ] || {
+        log WARN "服务 $service 不存在，跳过重启"
+        return 0
+    }
     before_pid="$(getprop init.svc_debug_pid."$service")"
     setprop ctl.restart "$service" 2>/dev/null || return 1
     while [ "$tries" -lt 5 ]; do
         sleep 1
         state="$(getprop init.svc."$service")"
         after_pid="$(getprop init.svc_debug_pid."$service")"
+        if [ "$state" = running ] && [ -z "$after_pid" ]; then
+            log WARN "服务 $service 已运行，但无法读取 debug pid；按 best-effort 视为重启完成"
+            return 0
+        fi
         if [ "$state" = running ] && [ -n "$after_pid" ] && \
             { [ -z "$before_pid" ] || [ "$after_pid" != "$before_pid" ]; }; then
             log INFO "服务 $service 已重启：pid $before_pid -> $after_pid"
@@ -813,17 +808,27 @@ service_state_is() {
 }
 
 services_configured() {
-    local result=0
+    local result=0 state
     if [ "$HORAE_MODE" = stop ]; then
-        [ "$(getprop persist.sys.horae.enable 2>/dev/null)" = 0 ] || result=1
-        service_state_is horae stopped || result=1
+        state="$(getprop init.svc.horae 2>/dev/null)"
+        if [ -n "$state" ]; then
+            [ "$(getprop persist.sys.horae.enable 2>/dev/null)" = 0 ] || result=1
+            service_state_is horae stopped || result=1
+        fi
     fi
     case "$VENDOR_THERMAL_HAL_MODE" in
-        stop) service_state_is vendor.thermal-hal-2-0.mtk stopped || result=1 ;;
-        restart) service_state_is vendor.thermal-hal-2-0.mtk running || result=1 ;;
+        stop)
+            state="$(getprop init.svc.vendor.thermal-hal-2-0.mtk 2>/dev/null)"
+            [ -z "$state" ] || service_state_is vendor.thermal-hal-2-0.mtk stopped || result=1
+            ;;
+        restart)
+            state="$(getprop init.svc.vendor.thermal-hal-2-0.mtk 2>/dev/null)"
+            [ -z "$state" ] || service_state_is vendor.thermal-hal-2-0.mtk running || result=1
+            ;;
     esac
     if [ "$THERMAL_CORE_MODE" = stop ]; then
-        service_state_is thermal_core stopped || result=1
+        state="$(getprop init.svc.thermal_core 2>/dev/null)"
+        [ -z "$state" ] || service_state_is thermal_core stopped || result=1
     fi
     return "$result"
 }
@@ -973,7 +978,6 @@ apply_runtime() {
         log INFO "当前运行时挂载、服务与无线调试状态均已生效，无需重复应用"
         return 0
     fi
-    device_guard || return 1
     check_conflicts || return 1
     wait_for_thermal_zones || return 1
 
@@ -990,36 +994,22 @@ apply_runtime() {
         return 1
     }
     apply_power_supply_battery || {
-        log ERROR "power_supply battery 应用失败，开始回滚"
-        restore_mounts
-        return 1
+        log WARN "power_supply battery 应用失败，已继续保留其他成功挂载"
     }
     apply_power_supply_charger || {
-        log ERROR "power_supply charger 应用失败，开始回滚"
-        restore_mounts
-        return 1
+        log WARN "power_supply charger 应用失败，已继续保留其他成功挂载"
     }
     verify_runtime || {
-        log ERROR "运行时验证失败，开始回滚"
-        restore_mounts
-        return 1
+        log WARN "运行时验证未完全通过，已继续保留成功挂载"
     }
     apply_proc_shell_temp || {
-        log ERROR "/proc/shell-temp 应用失败，开始回滚"
-        restore_mounts
-        write_shell_temp 0 2>/dev/null || true
-        return 1
+        log WARN "/proc/shell-temp 应用失败，已跳过该入口"
     }
     apply_private_services || {
-        log ERROR "厂商私有温控服务未按配置切换，开始回滚"
-        restore_runtime
-        return 1
+        log WARN "厂商私有温控服务未完全按配置切换，已继续保留成功挂载"
     }
     apply_adb_wifi || {
-        log ERROR "无线调试未达到配置状态，开始回滚"
-        restore_runtime
-        disable_adb_wifi 2>/dev/null || true
-        return 1
+        log WARN "无线调试未达到配置状态，已继续保留成功挂载"
     }
 
     if ! date '+%Y-%m-%d %H:%M:%S' > "$ACTIVE_FILE.tmp.$$" || \

@@ -1,6 +1,6 @@
 # PFFM20 Full Temperature Spoof
 
-仅针对当前实测设备设计：
+默认配置基于当前实测设备：
 
 - 型号：PFFM20
 - 平台：MT6983
@@ -11,7 +11,7 @@
 
 模块在 late_start service 阶段执行一次：
 
-1. 检查设备型号和冲突模块。
+1. 检查冲突模块；不校验机型、Android 版本或内核版本。
 2. 枚举 `/sys/class/thermal/thermal_zone*`。
 3. 根据 `type` 分类并从 `config.conf` 读取目标温度。
 4. 在 `/dev/pffm20_fulltempspoof` 下创建三个带固定原始 SELinux 标签的独立 tmpfs，
@@ -20,6 +20,11 @@
 6. 可选处理电池 power_supply 温度与 `/proc/shell-temp`。
 7. 根据配置停止 Horae、重启 MTK Vendor Thermal HAL，或保持/停止 thermal_core。
 8. 验证每个节点并生成映射表后退出，不驻留后台。
+
+跨设备使用时，模块采用 best-effort 策略：安装阶段会预检查并显示预计会跳过的
+thermal zone、power_supply 节点、`/proc/shell-temp` 或厂商服务；运行阶段会把实际
+跳过项记录到 `module.log`。只要至少一个 thermal zone 成功挂载，就不会因为其他入口
+失败而整体回滚。
 
 伪造文件通过 tmpfs 的 `context=` 挂载参数直接获得原温度节点使用的
 `sysfs_therm`、`sysfs_battery_supply` 或 `sysfs_batteryinfo` 标签。
