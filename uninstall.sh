@@ -107,13 +107,19 @@ else
         HORAE_STATE=
         THERMAL_HAL_STATE=
         THERMAL_CORE_STATE=
-        while IFS="$delimiter" read -r key value; do
+        DYNAMIC_SERVICE_FOUND=0
+        while IFS="$delimiter" read -r key value extra; do
             case "$key" in
                 HORAE_PROP_PRESENT) HORAE_PROP_PRESENT="$value" ;;
                 HORAE_PROP) HORAE_PROP="$value" ;;
                 HORAE_STATE) HORAE_STATE="$value" ;;
                 THERMAL_HAL_STATE) THERMAL_HAL_STATE="$value" ;;
                 THERMAL_CORE_STATE) THERMAL_CORE_STATE="$value" ;;
+                SERVICE_STATE)
+                    DYNAMIC_SERVICE_FOUND=1
+                    case "$value" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+                    case "$extra" in running|stopped) ;; *) return 1 ;; esac
+                    ;;
             esac
         done < "$ORIGINAL_RUNTIME_FILE"
 
@@ -135,9 +141,16 @@ else
         else
             service_result=1
         fi
-        restore_service_state_fallback horae "$HORAE_STATE" || service_result=1
-        restore_service_state_fallback vendor.thermal-hal-2-0.mtk "$THERMAL_HAL_STATE" || service_result=1
-        restore_service_state_fallback thermal_core "$THERMAL_CORE_STATE" || service_result=1
+        if [ "$DYNAMIC_SERVICE_FOUND" = 1 ]; then
+            while IFS="$delimiter" read -r key value extra; do
+                [ "$key" = SERVICE_STATE ] || continue
+                restore_service_state_fallback "$value" "$extra" || service_result=1
+            done < "$ORIGINAL_RUNTIME_FILE"
+        else
+            restore_service_state_fallback horae "$HORAE_STATE" || service_result=1
+            restore_service_state_fallback vendor.thermal-hal-2-0.mtk "$THERMAL_HAL_STATE" || service_result=1
+            restore_service_state_fallback thermal_core "$THERMAL_CORE_STATE" || service_result=1
+        fi
         [ "$service_result" -eq 0 ] && rm -f "$ORIGINAL_RUNTIME_FILE"
         return "$service_result"
     }
@@ -153,10 +166,8 @@ else
         [ "$result" -ne 0 ] || rm -f "$MOUNTS_FILE"
     fi
 
-    for dir in \
-        "$FAKE_ROOT/sysfs_batteryinfo" \
-        "$FAKE_ROOT/sysfs_battery_supply" \
-        "$FAKE_ROOT/sysfs_therm"; do
+    for dir in "$FAKE_ROOT"/*; do
+        [ -d "$dir" ] || continue
         if ! unmount_exact_fallback "$dir"; then
             result=1
         fi

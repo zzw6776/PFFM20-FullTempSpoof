@@ -104,7 +104,9 @@ for zone in /sys/class/thermal/thermal_zone*; do
     fi
 
     # 伪装目标温度
-    if category_enabled "$category"; then
+    if ! thermal_value_valid "$temp_raw"; then
+        tag="[当前值不在正常温度范围，运行时跳过]"
+    elif category_enabled "$category"; then
         target_c="$(category_temp_c "$category")"
         tag="-> 伪装 ${target_c}°C"
     else
@@ -127,22 +129,35 @@ echo "----------------------------------------"
 echo "  额外温度节点"
 echo "----------------------------------------"
 
-batt_path="/sys/class/power_supply/battery/temp"
-if [ -e "$batt_path" ]; then
-    batt_raw="$(cat "$batt_path" 2>/dev/null | tr -d ' \r\n')"
-    if [ -n "$batt_raw" ] && [ "$batt_raw" != "0" ] 2>/dev/null; then
-        batt_c="$(awk "BEGIN { printf \"%.1f\", $batt_raw / 10 }")"
+found_power_supply=0
+for power_path in /sys/class/power_supply/*/temp /sys/class/power_supply/*/temperature; do
+    [ -e "$power_path" ] || continue
+    found_power_supply=1
+    power_raw="$(cat "$power_path" 2>/dev/null | tr -d ' \r\n')"
+    power_fake="$(power_supply_target_value "$power_path")"
+    case "${power_path#/sys/class/power_supply/}" in
+        mtk-battery/temperature)
+            power_real_c="$power_raw"
+            power_fake_c="$power_fake"
+            ;;
+        *)
+            if [ -n "$power_raw" ] && [ "$power_raw" != "0" ] 2>/dev/null; then
+                power_real_c="$(awk "BEGIN { printf \"%.1f\", $power_raw / 10 }")"
+            else
+                power_real_c="$power_raw"
+            fi
+            power_fake_c="$(awk "BEGIN { printf \"%.1f\", $power_fake / 10 }")"
+            ;;
+    esac
+    if ! power_supply_value_valid "$power_path" "$power_raw"; then
+        echo "  ${power_path#/sys/class/power_supply/}: 真实 ${power_real_c}°C [当前值不在正常温度范围，运行时跳过]"
+    elif power_supply_target_enabled "$power_path"; then
+        echo "  ${power_path#/sys/class/power_supply/}: 真实 ${power_real_c}°C -> 伪装 ${power_fake_c}°C"
     else
-        batt_c="$batt_raw"
+        echo "  ${power_path#/sys/class/power_supply/}: 真实 ${power_real_c}°C [配置为不伪装]"
     fi
-    if [ "$POWER_SUPPLY_BATTERY_ENABLE" = 1 ]; then
-        echo "  电池 (power_supply): 真实 ${batt_c}°C -> 伪装 ${BATTERY_TEMP_C}°C"
-    else
-        echo "  电池 (power_supply): 真实 ${batt_c}°C [配置为不伪装]"
-    fi
-else
-    echo "  电池 (power_supply): 节点不存在"
-fi
+done
+[ "$found_power_supply" = 1 ] || echo "  power_supply 温度节点：未发现"
 
 if [ -r /proc/shell-temp ]; then
     if [ "$PROC_SHELL_TEMP_ENABLE" = 1 ]; then
@@ -160,11 +175,12 @@ echo "----------------------------------------"
 echo "  厂商温控服务状态"
 echo "----------------------------------------"
 horae_state="$(getprop init.svc.horae 2>/dev/null)"
-thermal_hal_state="$(getprop init.svc.vendor.thermal-hal-2-0.mtk 2>/dev/null)"
-thermal_core_state="$(getprop init.svc.thermal_core 2>/dev/null)"
-echo "  Horae:              ${horae_state:-未知} (配置: $HORAE_MODE)"
-echo "  MTK Thermal HAL:    ${thermal_hal_state:-未知} (配置: $VENDOR_THERMAL_HAL_MODE)"
-echo "  thermal_core:       ${thermal_core_state:-未知} (配置: $THERMAL_CORE_MODE)"
+echo "  统一服务模式:       ${THERMAL_SERVICES_MODE:-未知}"
+for svc in $(thermal_service_candidates); do
+    state="$(getprop init.svc."$svc" 2>/dev/null)"
+    [ -n "$state" ] || continue
+    echo "  $svc: $state"
+done
 
 # ---- 用最新配置重新应用伪装 ----
 echo ""

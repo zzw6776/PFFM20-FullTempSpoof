@@ -4,9 +4,6 @@ MODDIR="${MODDIR:-${0%/*}}"
 CONFIG_FILE="$MODDIR/config.conf"
 STATE_DIR="/data/adb/pffm20_fulltempspoof"
 FAKE_ROOT="/dev/pffm20_fulltempspoof"
-THERM_FAKE_ROOT="$FAKE_ROOT/sysfs_therm"
-BATTERY_SUPPLY_FAKE_ROOT="$FAKE_ROOT/sysfs_battery_supply"
-BATTERY_INFO_FAKE_ROOT="$FAKE_ROOT/sysfs_batteryinfo"
 LOG_FILE="$STATE_DIR/module.log"
 MOUNTS_FILE="$STATE_DIR/mounts.tsv"
 MAP_FILE="$STATE_DIR/thermal-map.tsv"
@@ -42,7 +39,9 @@ log() {
 load_config() {
     MASTER_ENABLE=1
     WAIT_TIMEOUT_SEC=120
-    EXPECTED_MIN_THERMAL_ZONES=51
+    THERMAL_VALUE_FILTER_ENABLE=1
+    THERMAL_VALID_MIN_MILLI_C=10000
+    THERMAL_VALID_MAX_MILLI_C=80000
 
     CPU_ENABLE=1; CPU_TEMP_C=40
     GPU_ENABLE=1; GPU_TEMP_C=40
@@ -60,9 +59,7 @@ load_config() {
 
     POWER_SUPPLY_BATTERY_ENABLE=1
     PROC_SHELL_TEMP_ENABLE=1
-    HORAE_MODE=stop
-    VENDOR_THERMAL_HAL_MODE=restart
-    THERMAL_CORE_MODE=keep
+    THERMAL_SERVICES_MODE=stop_then_restart
     CONFLICT_CHECK=1
     VERIFY_AFTER_APPLY=1
     ADB_WIFI_ENABLE=1
@@ -96,7 +93,8 @@ validate_config() {
         BATTERY_ENABLE CHARGER_ENABLE PMIC_ENABLE MODEM_RF_ENABLE \
         CONNECTIVITY_ENABLE NTC_AMBIENT_ENABLE UNKNOWN_ENABLE \
         POWER_SUPPLY_BATTERY_ENABLE PROC_SHELL_TEMP_ENABLE \
-        CONFLICT_CHECK VERIFY_AFTER_APPLY ADB_WIFI_ENABLE; do
+        THERMAL_VALUE_FILTER_ENABLE CONFLICT_CHECK VERIFY_AFTER_APPLY \
+        ADB_WIFI_ENABLE; do
         eval "value=\${$key}"
         is_bool "$value" || {
             log ERROR "配置错误：$key 必须为 0 或 1，当前为 $value"
@@ -115,15 +113,24 @@ validate_config() {
         }
     done
 
-    case "$HORAE_MODE" in stop|keep) ;; *) log ERROR "HORAE_MODE 只能为 stop/keep"; return 1 ;; esac
-    case "$VENDOR_THERMAL_HAL_MODE" in stop|keep|restart) ;; *) log ERROR "VENDOR_THERMAL_HAL_MODE 只能为 stop/keep/restart"; return 1 ;; esac
-    case "$THERMAL_CORE_MODE" in stop|keep) ;; *) log ERROR "THERMAL_CORE_MODE 只能为 stop/keep"; return 1 ;; esac
+    case "$THERMAL_SERVICES_MODE" in
+        stop_then_restart|stop|restart|keep) ;;
+        *) log ERROR "THERMAL_SERVICES_MODE 只能为 stop_then_restart/stop/restart/keep"; return 1 ;;
+    esac
     is_uint_range "$WAIT_TIMEOUT_SEC" 1 600 || {
         log ERROR "WAIT_TIMEOUT_SEC 必须是 1～600 的整数"
         return 1
     }
-    is_uint_range "$EXPECTED_MIN_THERMAL_ZONES" 1 256 || {
-        log ERROR "EXPECTED_MIN_THERMAL_ZONES 必须是 1～256 的整数"
+    is_uint_range "$THERMAL_VALID_MIN_MILLI_C" 0 200000 || {
+        log ERROR "THERMAL_VALID_MIN_MILLI_C 必须是 0～200000 的整数"
+        return 1
+    }
+    is_uint_range "$THERMAL_VALID_MAX_MILLI_C" 1 200000 || {
+        log ERROR "THERMAL_VALID_MAX_MILLI_C 必须是 1～200000 的整数"
+        return 1
+    }
+    [ "$THERMAL_VALID_MIN_MILLI_C" -lt "$THERMAL_VALID_MAX_MILLI_C" ] || {
+        log ERROR "THERMAL_VALID_MIN_MILLI_C 必须小于 THERMAL_VALID_MAX_MILLI_C"
         return 1
     }
     if [ "$ADB_WIFI_ENABLE" = 1 ]; then
@@ -173,17 +180,13 @@ wait_for_thermal_zones() {
             [ -e "$zone/temp" ] && count=$((count + 1))
         done
         [ -n "$count" ] || count=0
-        if [ "$count" -ge "$EXPECTED_MIN_THERMAL_ZONES" ]; then
+        if [ "$count" -gt 0 ]; then
             log INFO "thermal zone 已就绪：$count 个"
             return 0
         fi
         sleep 1
         elapsed=$((elapsed + 1))
     done
-    if [ "$count" -gt 0 ]; then
-        log WARN "等待 thermal zone 超时：仅发现 $count 个，期望至少 $EXPECTED_MIN_THERMAL_ZONES 个；继续按已发现节点应用"
-        return 0
-    fi
     log ERROR "等待 thermal zone 超时：未发现可用 thermal zone"
     return 1
 }
@@ -200,7 +203,7 @@ classify_zone() {
         shell*|skin*) echo SHELL_SKIN ;;
         *battery*|batt*|bms*) echo BATTERY ;;
         *charger*|usb-therm*|vbat*|ibat*) echo CHARGER ;;
-        pmic*|pm8*|xo|xo-*|pa-therm*) echo PMIC ;;
+        pmic*|pm[0-9]*|pmi*|pmr*|pmxr*|pmk*|xo|xo-*|pa-therm*) echo PMIC ;;
         md[0-9]*|*ltepa*|*nrpa*|*antenna*|*sub6*|*rfc*|*rf-*|*mmw*|*qtm*|*nss*|*wcn*) echo MODEM_RF ;;
         consys*|wlan*|wifi*|wcss*) echo CONNECTIVITY ;;
         *ntc*|ambient*|board*|quiet*|rear*|cam*) echo NTC_AMBIENT ;;
@@ -245,6 +248,43 @@ category_temp_c() {
     esac
 }
 
+signed_int() {
+    local value="$1" abs
+    case "$value" in
+        '') return 1 ;;
+        -*)
+            abs="${value#-}"
+            case "$abs" in ''|*[!0-9]*) return 1 ;; esac
+            ;;
+        *[!0-9]*) return 1 ;;
+    esac
+    return 0
+}
+
+thermal_value_valid() {
+    local value="$1"
+    [ "${THERMAL_VALUE_FILTER_ENABLE:-1}" = 1 ] || return 0
+    signed_int "$value" || return 1
+    [ "$value" -ge "$THERMAL_VALID_MIN_MILLI_C" ] && \
+        [ "$value" -le "$THERMAL_VALID_MAX_MILLI_C" ]
+}
+
+valid_min_c() {
+    printf '%s\n' $(((THERMAL_VALID_MIN_MILLI_C + 999) / 1000))
+}
+
+valid_max_c() {
+    printf '%s\n' $((THERMAL_VALID_MAX_MILLI_C / 1000))
+}
+
+valid_min_deci_c() {
+    printf '%s\n' $(((THERMAL_VALID_MIN_MILLI_C + 99) / 100))
+}
+
+valid_max_deci_c() {
+    printf '%s\n' $((THERMAL_VALID_MAX_MILLI_C / 100))
+}
+
 is_exact_mountpoint() {
     awk -v target="$1" '$5 == target { found=1 } END { exit !found }' /proc/self/mountinfo 2>/dev/null
 }
@@ -267,6 +307,34 @@ get_selinux_context() {
     ls -Zd "$1" 2>/dev/null | awk '{print $1}'
 }
 
+context_allowed() {
+    case "$1" in
+        u:object_r:sysfs_therm:s0|\
+        u:object_r:sysfs_battery_supply:s0|\
+        u:object_r:sysfs_batteryinfo:s0|\
+        u:object_r:sysfs_thermal:s0|\
+        u:object_r:vendor_sysfs_battery_supply:s0|\
+        u:object_r:vendor_sysfs_usb_supply:s0) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+context_type_name() {
+    local type
+    context_allowed "$1" || return 1
+    type="$(printf '%s\n' "$1" | awk -F: '{print $3}')"
+    case "$type" in
+        ''|*[!A-Za-z0-9_]* ) return 1 ;;
+    esac
+    printf '%s\n' "$type"
+}
+
+fake_root_for_context() {
+    local type
+    type="$(context_type_name "$1")" || return 1
+    printf '%s\n' "$FAKE_ROOT/ctx_$type"
+}
+
 mount_context_tmpfs() {
     local dir="$1" context="$2" actual
     mkdir -p "$dir" 2>/dev/null || return 1
@@ -285,7 +353,9 @@ mount_context_tmpfs() {
 
 restore_fake_roots() {
     local dir result=0
-    for dir in "$BATTERY_INFO_FAKE_ROOT" "$BATTERY_SUPPLY_FAKE_ROOT" "$THERM_FAKE_ROOT"; do
+    [ -d "$FAKE_ROOT" ] || return 0
+    for dir in "$FAKE_ROOT"/*; do
+        [ -d "$dir" ] || continue
         unmount_exact "$dir" || result=1
     done
     [ "$result" -eq 0 ] && rm -rf "$FAKE_ROOT" 2>/dev/null
@@ -296,30 +366,19 @@ prepare_fake_roots() {
     mkdir -p "$FAKE_ROOT" 2>/dev/null || return 1
     chown 0:0 "$FAKE_ROOT" 2>/dev/null
     chmod 0700 "$FAKE_ROOT" 2>/dev/null
-
-    mount_context_tmpfs "$THERM_FAKE_ROOT" "u:object_r:sysfs_therm:s0" || {
-        restore_fake_roots
-        return 1
-    }
-    mount_context_tmpfs "$BATTERY_SUPPLY_FAKE_ROOT" "u:object_r:sysfs_battery_supply:s0" || {
-        restore_fake_roots
-        return 1
-    }
-    mount_context_tmpfs "$BATTERY_INFO_FAKE_ROOT" "u:object_r:sysfs_batteryinfo:s0" || {
-        restore_fake_roots
-        return 1
-    }
-    log INFO "已创建三个固定 SELinux context tmpfs，无需修改 live sepolicy"
+    log INFO "已准备动态 SELinux context tmpfs 根目录，无需修改 live sepolicy"
     return 0
 }
 
-fake_root_for_context() {
-    case "$1" in
-        u:object_r:sysfs_therm:s0) echo "$THERM_FAKE_ROOT" ;;
-        u:object_r:sysfs_battery_supply:s0) echo "$BATTERY_SUPPLY_FAKE_ROOT" ;;
-        u:object_r:sysfs_batteryinfo:s0) echo "$BATTERY_INFO_FAKE_ROOT" ;;
-        *) return 1 ;;
-    esac
+ensure_fake_root_for_context() {
+    local context="$1" root
+    root="$(fake_root_for_context "$context")" || return 1
+    if is_exact_mountpoint "$root"; then
+        printf '%s\n' "$root"
+        return 0
+    fi
+    mount_context_tmpfs "$root" "$context" || return 1
+    printf '%s\n' "$root"
 }
 
 runtime_mounts_any_present() {
@@ -333,9 +392,11 @@ runtime_mounts_any_present() {
 }
 
 expected_runtime_targets() {
-    local zone type category target suffix
+    local zone type category target p raw
     for zone in /sys/class/thermal/thermal_zone*; do
         [ -e "$zone/temp" ] || continue
+        raw="$(cat "$zone/temp" 2>/dev/null | tr -d ' \r\n')"
+        thermal_value_valid "$raw" || continue
         type="$(cat "$zone/type" 2>/dev/null | tr -d '\r\n')"
         [ -n "$type" ] || type=unknown
         category="$(classify_zone "$type")"
@@ -345,25 +406,14 @@ expected_runtime_targets() {
         printf '%s\n' "$target"
     done
 
-    if [ "$POWER_SUPPLY_BATTERY_ENABLE" = 1 ]; then
-        for target in \
-            /sys/class/power_supply/battery/temp \
-            /sys/class/power_supply/mtk-battery/temp \
-            /sys/class/power_supply/mtk-battery/temperature; do
-            [ -e "$target" ] || continue
-            target="$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
-            [ -n "$target" ] && printf '%s\n' "$target"
-        done
-    fi
-
-    if [ "${CHARGER_ENABLE:-1}" = 1 ]; then
-        for suffix in master-charger mst-div-charger slave-charger slv-div-charger; do
-            target="/sys/class/power_supply/mtk-$suffix/temp"
-            [ -e "$target" ] || continue
-            target="$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
-            [ -n "$target" ] && printf '%s\n' "$target"
-        done
-    fi
+    for p in /sys/class/power_supply/*/temp /sys/class/power_supply/*/temperature; do
+        [ -e "$p" ] || continue
+        power_supply_target_enabled "$p" || continue
+        raw="$(cat "$p" 2>/dev/null | tr -d ' \r\n')"
+        power_supply_value_valid "$p" "$raw" || continue
+        target="$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")"
+        [ -n "$target" ] && printf '%s\n' "$target"
+    done
 }
 
 mount_record_has_target() {
@@ -380,12 +430,9 @@ runtime_tracked_mountpoints() {
 }
 
 runtime_mounts_complete() {
-    local target source target_value source_value target_context source_context mounted
+    local target source target_value source_value target_context source_context mounted source_root
     local count=0 failed=0
     [ -s "$MOUNTS_FILE" ] || return 1
-    is_exact_mountpoint "$THERM_FAKE_ROOT" || return 1
-    is_exact_mountpoint "$BATTERY_SUPPLY_FAKE_ROOT" || return 1
-    is_exact_mountpoint "$BATTERY_INFO_FAKE_ROOT" || return 1
 
     for mounted in $(runtime_tracked_mountpoints); do
         mount_record_has_target "$mounted" || failed=1
@@ -405,6 +452,8 @@ runtime_mounts_complete() {
             failed=1
             continue
         }
+        source_root="${source%/*}"
+        is_exact_mountpoint "$source_root" || failed=1
         target_value="$(cat "$target" 2>/dev/null | tr -d ' \r\n')"
         source_value="$(cat "$source" 2>/dev/null | tr -d ' \r\n')"
         target_context="$(get_selinux_context "$target")"
@@ -462,12 +511,8 @@ bind_fake_value() {
     fi
 
     target_context="$(get_selinux_context "$real")"
-    source_root="$(fake_root_for_context "$target_context")" || {
+    source_root="$(ensure_fake_root_for_context "$target_context")" || {
         log ERROR "目标 SELinux 标签不在允许清单：$real context=$target_context"
-        return 1
-    }
-    is_exact_mountpoint "$source_root" || {
-        log ERROR "伪造文件 context tmpfs 未挂载：$source_root"
         return 1
     }
 
@@ -503,7 +548,7 @@ bind_fake_value() {
 }
 
 apply_thermal_zones() {
-    local zone name type category temp_c temp_milli before mode result mounted=0 skipped=0 failed=0
+    local zone name type category temp_c temp_milli before mode result mounted=0 skipped=0 failed=0 invalid=0
     : > "$MOUNTS_FILE" || return 1
     printf 'zone\ttype\tcategory\tbefore\tfake\tmode\tresult\n' > "$MAP_FILE" || return 1
 
@@ -517,6 +562,13 @@ apply_thermal_zones() {
         [ -n "$before" ] || before=-
         [ -n "$mode" ] || mode=-
         category="$(classify_zone "$type")"
+
+        if ! thermal_value_valid "$before"; then
+            printf '%s\t%s\t%s\t%s\t-\t%s\tskipped-invalid-value\n' "$name" "$type" "$category" "$before" "$mode" >> "$MAP_FILE"
+            invalid=$((invalid + 1))
+            skipped=$((skipped + 1))
+            continue
+        fi
 
         if ! category_enabled "$category"; then
             printf '%s\t%s\t%s\t%s\t-\t%s\tdisabled-by-config\n' "$name" "$type" "$category" "$before" "$mode" >> "$MAP_FILE"
@@ -536,7 +588,7 @@ apply_thermal_zones() {
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$type" "$category" "$before" "$temp_milli" "$mode" "$result" >> "$MAP_FILE"
     done
 
-    log INFO "thermal zone 应用完成：mounted=$mounted skipped=$skipped failed=$failed"
+    log INFO "thermal zone 应用完成：mounted=$mounted skipped=$skipped invalid=$invalid failed=$failed"
     if [ "$mounted" -gt 0 ]; then
         [ "$failed" -eq 0 ] || log WARN "部分 thermal zone 未能伪装，已继续保留成功挂载的节点"
         return 0
@@ -545,49 +597,111 @@ apply_thermal_zones() {
     return 1
 }
 
+power_supply_target_enabled() {
+    local path="$1" supply
+    supply="${path#/sys/class/power_supply/}"
+    supply="${supply%%/*}"
+    case "$supply" in
+        *battery*|*gauge*) [ "$POWER_SUPPLY_BATTERY_ENABLE" = 1 ] ;;
+        *) [ "$CHARGER_ENABLE" = 1 ] ;;
+    esac
+}
+
+power_supply_target_value() {
+    local path="$1" supply file
+    supply="${path#/sys/class/power_supply/}"
+    supply="${supply%%/*}"
+    file="${path##*/}"
+    case "$supply/$file" in
+        mtk-battery/temperature) printf '%s\n' "$BATTERY_TEMP_C" ;;
+        *battery*/*|*gauge*/*) printf '%s\n' $((BATTERY_TEMP_C * 10)) ;;
+        *) printf '%s\n' $((CHARGER_TEMP_C * 10)) ;;
+    esac
+}
+
+power_supply_value_valid() {
+    local path="$1" value="$2" min max
+    [ "${THERMAL_VALUE_FILTER_ENABLE:-1}" = 1 ] || return 0
+    signed_int "$value" || return 1
+    case "${path#/sys/class/power_supply/}" in
+        mtk-battery/temperature)
+            min="$(valid_min_c)"
+            max="$(valid_max_c)"
+            ;;
+        *)
+            min="$(valid_min_deci_c)"
+            max="$(valid_max_deci_c)"
+            ;;
+    esac
+    [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]
+}
+
+power_supply_source_name() {
+    local path="$1" supply file
+    supply="${path#/sys/class/power_supply/}"
+    supply="${supply%%/*}"
+    file="${path##*/}"
+    printf 'power_supply_%s_%s\n' "$supply" "$file" | sed 's/[^A-Za-z0-9_]/_/g'
+}
+
 apply_power_supply_battery() {
     [ "$POWER_SUPPLY_BATTERY_ENABLE" = 1 ] || return 0
-    local target value res=0
-
-    # 1. 通用电池温度节点
-    target="/sys/class/power_supply/battery/temp"
-    if [ -e "$target" ]; then
-        value=$((BATTERY_TEMP_C * 10))
-        bind_fake_value "$target" power_supply_battery_temp "$value" && \
-            log INFO "power_supply battery temp 已伪装为 ${BATTERY_TEMP_C}°C" || res=1
-    fi
-
-    # 2. MTK 电池温度节点
-    target="/sys/class/power_supply/mtk-battery/temp"
-    if [ -e "$target" ]; then
-        value=$((BATTERY_TEMP_C * 10))
-        bind_fake_value "$target" mtk_battery_temp "$value" && \
-            log INFO "power_supply mtk-battery temp 已伪装为 ${BATTERY_TEMP_C}°C" || res=1
-    fi
-
-    # 3. MTK 电池温度(摄氏度无倍数)节点
-    target="/sys/class/power_supply/mtk-battery/temperature"
-    if [ -e "$target" ]; then
-        value="$BATTERY_TEMP_C"
-        bind_fake_value "$target" mtk_battery_temperature "$value" && \
-            log INFO "power_supply mtk-battery temperature 已伪装为 ${BATTERY_TEMP_C}°C" || res=1
-    fi
+    local target raw value name res=0 mounted=0 skipped=0 failed=0
+    for target in /sys/class/power_supply/*/temp /sys/class/power_supply/*/temperature; do
+        [ -e "$target" ] || continue
+        power_supply_target_enabled "$target" || continue
+        case "${target#/sys/class/power_supply/}" in
+            *battery*/*|*gauge*/*) ;;
+            *) continue ;;
+        esac
+        raw="$(cat "$target" 2>/dev/null | tr -d ' \r\n')"
+        if ! power_supply_value_valid "$target" "$raw"; then
+            skipped=$((skipped + 1))
+            log INFO "$target 当前值 $raw 不在正常温度范围，已跳过"
+            continue
+        fi
+        value="$(power_supply_target_value "$target")"
+        name="$(power_supply_source_name "$target")"
+        if bind_fake_value "$target" "$name" "$value"; then
+            mounted=$((mounted + 1))
+            log INFO "$target 已伪装为 $value"
+        else
+            failed=$((failed + 1))
+            res=1
+        fi
+    done
+    log INFO "power_supply battery 动态应用完成：mounted=$mounted skipped=$skipped failed=$failed"
 
     return "$res"
 }
 
 apply_power_supply_charger() {
     [ "${CHARGER_ENABLE:-1}" = 1 ] || return 0
-    local target value name res=0 charger_temp_c="${CHARGER_TEMP_C:-35}"
+    local target raw value name res=0 mounted=0 skipped=0 failed=0
 
-    for suffix in master-charger mst-div-charger slave-charger slv-div-charger; do
-        target="/sys/class/power_supply/mtk-$suffix/temp"
+    for target in /sys/class/power_supply/*/temp /sys/class/power_supply/*/temperature; do
         [ -e "$target" ] || continue
-        value=$((charger_temp_c * 10))
-        name="mtk_$(echo "$suffix" | tr '-' '_')_temp"
-        bind_fake_value "$target" "$name" "$value" && \
-            log INFO "power_supply mtk-$suffix temp 已伪装为 ${charger_temp_c}°C" || res=1
+        power_supply_target_enabled "$target" || continue
+        case "${target#/sys/class/power_supply/}" in
+            *battery*/*|*gauge*/*) continue ;;
+        esac
+        raw="$(cat "$target" 2>/dev/null | tr -d ' \r\n')"
+        if ! power_supply_value_valid "$target" "$raw"; then
+            skipped=$((skipped + 1))
+            log INFO "$target 当前值 $raw 不在正常温度范围，已跳过"
+            continue
+        fi
+        value="$(power_supply_target_value "$target")"
+        name="$(power_supply_source_name "$target")"
+        if bind_fake_value "$target" "$name" "$value"; then
+            mounted=$((mounted + 1))
+            log INFO "$target 已伪装为 $value"
+        else
+            failed=$((failed + 1))
+            res=1
+        fi
     done
+    log INFO "power_supply charger/usb/wireless 动态应用完成：mounted=$mounted skipped=$skipped failed=$failed"
 
     return "$res"
 }
@@ -618,8 +732,24 @@ property_exists() {
     getprop 2>/dev/null | grep -F -q "[$1]:"
 }
 
+thermal_service_candidates() {
+    printf '%s\n' \
+        horae \
+        vendor.thermal-hal-2-0.mtk \
+        thermal_core \
+        thermal-engine \
+        qti.thermal-engine \
+        vendor.thermal-hal \
+        vendor.thermal-hal-aidl \
+        vendor.thermal-hal-2-0
+}
+
+service_exists() {
+    [ -n "$(getprop init.svc."$1" 2>/dev/null)" ]
+}
+
 load_runtime_state_file() {
-    local file="${1:-$ORIGINAL_RUNTIME_FILE}" key value delimiter
+    local file="${1:-$ORIGINAL_RUNTIME_FILE}" key value extra delimiter
     RUNTIME_HORAE_PROP_PRESENT=
     RUNTIME_HORAE_PROP=
     RUNTIME_HORAE_STATE=
@@ -629,13 +759,17 @@ load_runtime_state_file() {
 
     delimiter="$TAB"
     grep -q "$TAB" "$file" 2>/dev/null || delimiter="="
-    while IFS="$delimiter" read -r key value; do
+    while IFS="$delimiter" read -r key value extra; do
         case "$key" in
             HORAE_PROP_PRESENT) RUNTIME_HORAE_PROP_PRESENT="$value" ;;
             HORAE_PROP) RUNTIME_HORAE_PROP="$value" ;;
             HORAE_STATE) RUNTIME_HORAE_STATE="$value" ;;
             THERMAL_HAL_STATE) RUNTIME_THERMAL_HAL_STATE="$value" ;;
             THERMAL_CORE_STATE) RUNTIME_THERMAL_CORE_STATE="$value" ;;
+            SERVICE_STATE)
+                case "$value" in ''|*[!A-Za-z0-9_.-]*) log ERROR "服务状态备份服务名格式错误：$value"; return 1 ;; esac
+                case "$extra" in running|stopped) ;; *) log ERROR "服务状态备份格式错误：$value=$extra"; return 1 ;; esac
+                ;;
         esac
     done < "$file"
 
@@ -656,7 +790,7 @@ load_runtime_state_file() {
 }
 
 backup_runtime_state() {
-    local horae_prop_present=0 tmp="$ORIGINAL_RUNTIME_FILE.tmp.$$"
+    local horae_prop_present=0 tmp="$ORIGINAL_RUNTIME_FILE.tmp.$$" service state
     if [ -f "$ORIGINAL_RUNTIME_FILE" ]; then
         load_runtime_state_file "$ORIGINAL_RUNTIME_FILE" || {
             log ERROR "已有服务状态备份格式无效，拒绝继续覆盖运行状态"
@@ -668,9 +802,12 @@ backup_runtime_state() {
     {
         printf 'HORAE_PROP_PRESENT\t%s\n' "$horae_prop_present"
         printf 'HORAE_PROP\t%s\n' "$(getprop persist.sys.horae.enable)"
-        printf 'HORAE_STATE\t%s\n' "$(getprop init.svc.horae)"
-        printf 'THERMAL_HAL_STATE\t%s\n' "$(getprop init.svc.vendor.thermal-hal-2-0.mtk)"
-        printf 'THERMAL_CORE_STATE\t%s\n' "$(getprop init.svc.thermal_core)"
+        for service in $(thermal_service_candidates); do
+            state="$(getprop init.svc."$service" 2>/dev/null)"
+            case "$state" in
+                running|stopped) printf 'SERVICE_STATE\t%s\t%s\n' "$service" "$state" ;;
+            esac
+        done
     } > "$tmp" || {
         rm -f "$tmp"
         return 1
@@ -761,33 +898,51 @@ restart_init_service() {
     return 1
 }
 
+apply_service_mode() {
+    local service="$1" result=0
+    service_exists "$service" || return 0
+    case "$THERMAL_SERVICES_MODE" in
+        keep)
+            return 0
+            ;;
+        stop)
+            stop_init_service "$service" || result=1
+            ;;
+        restart)
+            restart_init_service "$service" || result=1
+            ;;
+        stop_then_restart)
+            stop_init_service "$service" || {
+                log WARN "服务 $service 停止失败，回退为重启"
+                restart_init_service "$service" || result=1
+            }
+            ;;
+    esac
+    return "$result"
+}
+
 apply_private_services() {
-    local result=0
+    local result=0 service
     backup_runtime_state || {
         log ERROR "备份服务运行状态失败"
         return 1
     }
 
-    if [ "$HORAE_MODE" = stop ]; then
-        if command -v resetprop >/dev/null 2>&1; then
-            resetprop -n persist.sys.horae.enable 0 2>/dev/null || result=1
-        else
-            result=1
-        fi
-        stop_init_service horae || result=1
-    fi
-
-    case "$VENDOR_THERMAL_HAL_MODE" in
-        stop)
-            stop_init_service vendor.thermal-hal-2-0.mtk || result=1
-            ;;
-        restart)
-            restart_init_service vendor.thermal-hal-2-0.mtk || result=1
+    case "$THERMAL_SERVICES_MODE" in
+        stop|stop_then_restart)
+            if service_exists horae; then
+                if command -v resetprop >/dev/null 2>&1; then
+                    resetprop -n persist.sys.horae.enable 0 2>/dev/null || result=1
+                else
+                    result=1
+                fi
+            fi
             ;;
     esac
-    if [ "$THERMAL_CORE_MODE" = stop ]; then
-        stop_init_service thermal_core || result=1
-    fi
+
+    for service in $(thermal_service_candidates); do
+        apply_service_mode "$service" || result=1
+    done
     return "$result"
 }
 
@@ -808,28 +963,24 @@ service_state_is() {
 }
 
 services_configured() {
-    local result=0 state
-    if [ "$HORAE_MODE" = stop ]; then
-        state="$(getprop init.svc.horae 2>/dev/null)"
-        if [ -n "$state" ]; then
-            [ "$(getprop persist.sys.horae.enable 2>/dev/null)" = 0 ] || result=1
-            service_state_is horae stopped || result=1
-        fi
-    fi
-    case "$VENDOR_THERMAL_HAL_MODE" in
-        stop)
-            state="$(getprop init.svc.vendor.thermal-hal-2-0.mtk 2>/dev/null)"
-            [ -z "$state" ] || service_state_is vendor.thermal-hal-2-0.mtk stopped || result=1
-            ;;
-        restart)
-            state="$(getprop init.svc.vendor.thermal-hal-2-0.mtk 2>/dev/null)"
-            [ -z "$state" ] || service_state_is vendor.thermal-hal-2-0.mtk running || result=1
+    local result=0 state service
+    [ "$THERMAL_SERVICES_MODE" = keep ] && return 0
+    case "$THERMAL_SERVICES_MODE" in
+        stop|stop_then_restart)
+            if service_exists horae; then
+                [ "$(getprop persist.sys.horae.enable 2>/dev/null)" = 0 ] || result=1
+            fi
             ;;
     esac
-    if [ "$THERMAL_CORE_MODE" = stop ]; then
-        state="$(getprop init.svc.thermal_core 2>/dev/null)"
-        [ -z "$state" ] || service_state_is thermal_core stopped || result=1
-    fi
+    for service in $(thermal_service_candidates); do
+        state="$(getprop init.svc."$service" 2>/dev/null)"
+        [ -n "$state" ] || continue
+        case "$THERMAL_SERVICES_MODE" in
+            stop) [ "$state" = stopped ] || result=1 ;;
+            restart) [ "$state" = running ] || result=1 ;;
+            stop_then_restart) case "$state" in stopped|running) ;; *) result=1 ;; esac ;;
+        esac
+    done
     return "$result"
 }
 
@@ -1051,7 +1202,7 @@ restore_mounts() {
 }
 
 restore_runtime_services() {
-    local force_restart="${1:-0}" result=0
+    local force_restart="${1:-0}" result=0 key service state delimiter restored_dynamic=0
     [ -r "$ORIGINAL_RUNTIME_FILE" ] || return 0
 
     load_runtime_state_file "$ORIGINAL_RUNTIME_FILE" || return 1
@@ -1065,18 +1216,40 @@ restore_runtime_services() {
     else
         result=1
     fi
-    if [ "$RUNTIME_HORAE_STATE" = running ]; then
-        if [ "$force_restart" = 1 ]; then restart_init_service horae || result=1; else start_init_service horae || result=1; fi
+
+    delimiter="$TAB"
+    grep -q "$TAB" "$ORIGINAL_RUNTIME_FILE" 2>/dev/null || delimiter="="
+    while IFS="$delimiter" read -r key service state; do
+        [ "$key" = SERVICE_STATE ] || continue
+        restored_dynamic=1
+        case "$state" in
+            running)
+                if [ "$force_restart" = 1 ]; then
+                    restart_init_service "$service" || result=1
+                else
+                    start_init_service "$service" || result=1
+                fi
+                ;;
+            stopped)
+                stop_init_service "$service" || result=1
+                ;;
+        esac
+    done < "$ORIGINAL_RUNTIME_FILE"
+
+    if [ "$restored_dynamic" = 0 ]; then
+        if [ "$RUNTIME_HORAE_STATE" = running ]; then
+            if [ "$force_restart" = 1 ]; then restart_init_service horae || result=1; else start_init_service horae || result=1; fi
+        fi
+        if [ "$RUNTIME_HORAE_STATE" = stopped ]; then stop_init_service horae || result=1; fi
+        if [ "$RUNTIME_THERMAL_HAL_STATE" = running ]; then
+            if [ "$force_restart" = 1 ]; then restart_init_service vendor.thermal-hal-2-0.mtk || result=1; else start_init_service vendor.thermal-hal-2-0.mtk || result=1; fi
+        fi
+        if [ "$RUNTIME_THERMAL_HAL_STATE" = stopped ]; then stop_init_service vendor.thermal-hal-2-0.mtk || result=1; fi
+        if [ "$RUNTIME_THERMAL_CORE_STATE" = running ]; then
+            if [ "$force_restart" = 1 ]; then restart_init_service thermal_core || result=1; else start_init_service thermal_core || result=1; fi
+        fi
+        if [ "$RUNTIME_THERMAL_CORE_STATE" = stopped ]; then stop_init_service thermal_core || result=1; fi
     fi
-    if [ "$RUNTIME_HORAE_STATE" = stopped ]; then stop_init_service horae || result=1; fi
-    if [ "$RUNTIME_THERMAL_HAL_STATE" = running ]; then
-        if [ "$force_restart" = 1 ]; then restart_init_service vendor.thermal-hal-2-0.mtk || result=1; else start_init_service vendor.thermal-hal-2-0.mtk || result=1; fi
-    fi
-    if [ "$RUNTIME_THERMAL_HAL_STATE" = stopped ]; then stop_init_service vendor.thermal-hal-2-0.mtk || result=1; fi
-    if [ "$RUNTIME_THERMAL_CORE_STATE" = running ]; then
-        if [ "$force_restart" = 1 ]; then restart_init_service thermal_core || result=1; else start_init_service thermal_core || result=1; fi
-    fi
-    if [ "$RUNTIME_THERMAL_CORE_STATE" = stopped ]; then stop_init_service thermal_core || result=1; fi
 
     if [ "$result" -eq 0 ]; then
         rm -f "$ORIGINAL_RUNTIME_FILE"

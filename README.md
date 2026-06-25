@@ -14,20 +14,23 @@
 1. 检查冲突模块；不校验机型、Android 版本或内核版本。
 2. 枚举 `/sys/class/thermal/thermal_zone*`。
 3. 根据 `type` 分类并从 `config.conf` 读取目标温度。
-4. 在 `/dev/pffm20_fulltempspoof` 下创建三个带固定原始 SELinux 标签的独立 tmpfs，
-   分别保存 thermal、电池供电与 MTK 电池伪造文件。
+4. 按目标节点 SELinux 标签在 `/dev/pffm20_fulltempspoof` 下动态创建独立 tmpfs，
+   分别保存不同标签对应的伪造文件。
 5. 将伪造文件 bind mount 到每个 `thermal_zoneN/temp`。
 6. 可选处理电池 power_supply 温度与 `/proc/shell-temp`。
-7. 根据配置停止 Horae、重启 MTK Vendor Thermal HAL，或保持/停止 thermal_core。
+7. 根据配置动态处理当前设备存在的 Horae、MTK、Qualcomm 温控服务。
 8. 验证每个节点并生成映射表后退出，不驻留后台。
 
 跨设备使用时，模块采用 best-effort 策略：安装阶段会预检查并显示预计会跳过的
 thermal zone、power_supply 节点、`/proc/shell-temp` 或厂商服务；运行阶段会把实际
-跳过项记录到 `module.log`。只要至少一个 thermal zone 成功挂载，就不会因为其他入口
-失败而整体回滚。
+跳过项记录到 `module.log`。thermal zone 数量不再写死，当前设备发现几个就处理几个。
+只要至少一个 thermal zone 成功挂载，就不会因为其他入口失败而整体回滚。
+默认只伪装当前值位于 10°C～80°C 的 thermal zone 和 power_supply 温度节点，
+用于跳过 0、vbat 电压值、`-273000` 等明显不是正常温度读数的节点。
 
-伪造文件通过 tmpfs 的 `context=` 挂载参数直接获得原温度节点使用的
-`sysfs_therm`、`sysfs_battery_supply` 或 `sysfs_batteryinfo` 标签。
+伪造文件通过 tmpfs 的 `context=` 挂载参数直接获得原温度节点使用的 SELinux 标签。
+当前白名单包括 `sysfs_therm`、`sysfs_thermal`、`sysfs_battery_supply`、
+`sysfs_batteryinfo`、`vendor_sysfs_battery_supply` 和 `vendor_sysfs_usb_supply`。
 模块不会使用 `magiskpolicy --live` 修改运行时 SELinux 策略。
 
 ## 明确不会做的事情
@@ -77,7 +80,7 @@ trip_point_0_temp=116500
 1. 在 Magisk 中停用或卸载 AaTempSpoof、ColorOS解除温控限制及其他温度挂载模块。
 2. 重启一次，确保旧模块的 bind mount 已全部消失。
 3. 安装本模块 ZIP 并重启。
-4. 检查 `module.log` 和 `thermal-map.tsv`；映射表应有 51 行 `mounted`。
+4. 检查 `module.log` 和 `thermal-map.tsv`；映射表中的 `mounted` 数量以当前设备实际 thermal zone 为准。
 
 如果没有先处理旧模块，本模块会因冲突检测而拒绝应用，不会强行覆盖。
 
@@ -102,5 +105,5 @@ trip_point_0_temp=116500
 ## 风险边界
 
 默认配置会伪装包括电池、PMIC、充电器和 soc_max 在内的全部温度入口，
-并停止 Horae、在挂载后重启 MTK Vendor Thermal HAL。内核 116.5°C critical 是最后保护，
+并按统一服务模式处理当前设备存在的 Horae、MTK 或 Qualcomm 温控服务。内核 116.5°C critical 是最后保护，
 并不是适合长期触发的工作温度；电池、充电 IC 或其他硬件也可能在到达该阈值前受损。
