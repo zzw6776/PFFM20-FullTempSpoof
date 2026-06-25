@@ -7,7 +7,25 @@ acquire_lock || {
     echo "已有实例正在执行，请稍后重试"
     exit 1
 }
-trap 'release_lock' EXIT INT TERM
+cleanup_lock() {
+    release_lock
+}
+
+handle_int() {
+    trap - EXIT INT TERM
+    release_lock
+    exit 130
+}
+
+handle_term() {
+    trap - EXIT INT TERM
+    release_lock
+    exit 143
+}
+
+trap 'cleanup_lock' EXIT
+trap 'handle_int' INT
+trap 'handle_term' TERM
 
 category_name_cn() {
     case "$1" in
@@ -53,7 +71,10 @@ echo ""
 # ---- 卸载当前伪装，暴露真实温度 ----
 if [ "$was_active" = 1 ]; then
     echo "正在卸载伪装以读取真实温度……"
-    restore_runtime
+    if ! restore_runtime; then
+        echo "恢复真实温度失败，已停止重新应用；请检查日志：$LOG_FILE"
+        exit 1
+    fi
     echo ""
 fi
 
@@ -162,4 +183,3 @@ else
     echo "✗ 应用失败，请检查日志：$LOG_FILE"
     exit 1
 fi
-
