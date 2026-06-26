@@ -6,7 +6,7 @@ STATE_DIR="/data/adb/pffm20_fulltempspoof"
 FAKE_ROOT="/dev/pffm20_fulltempspoof"
 LOG_FILE="$STATE_DIR/module.log"
 MOUNTS_FILE="$STATE_DIR/mounts.tsv"
-MAP_FILE="$STATE_DIR/thermal-map.tsv"
+MAP_FILE="$STATE_DIR/thermal-map.csv"
 ACTIVE_FILE="$STATE_DIR/active"
 DISABLED_FILE="$STATE_DIR/user_disabled"
 LOCK_DIR="$STATE_DIR/lock"
@@ -41,7 +41,7 @@ load_config() {
     WAIT_TIMEOUT_SEC=120
     THERMAL_VALUE_FILTER_ENABLE=1
     THERMAL_VALID_MIN_MILLI_C=10000
-    THERMAL_VALID_MAX_MILLI_C=80000
+    THERMAL_VALID_MAX_MILLI_C=130000
 
     CPU_ENABLE=1; CPU_TEMP_C=40
     GPU_ENABLE=1; GPU_TEMP_C=40
@@ -547,10 +547,41 @@ bind_fake_value() {
     return 0
 }
 
+csv_escape() {
+    local value
+    value="$(printf '%s' "$1" | sed 's/"/""/g')"
+    printf '"%s"' "$value"
+}
+
+map_write_csv_row() {
+    local file="$1"
+    {
+        csv_escape "$2"; printf ','
+        csv_escape "$3"; printf ','
+        csv_escape "$4"; printf ','
+        csv_escape "$5"; printf ','
+        csv_escape "$6"; printf ','
+        csv_escape "$7"; printf ','
+        csv_escape "$8"; printf '\n'
+    } >> "$file"
+}
+
 apply_thermal_zones() {
     local zone name type category temp_c temp_milli before mode result mounted=0 skipped=0 failed=0 invalid=0
+    local skipped_map="$STATE_DIR/thermal-map.skipped.$$"
+    local failed_map="$STATE_DIR/thermal-map.failed.$$"
+    local mounted_map="$STATE_DIR/thermal-map.mounted.$$"
     : > "$MOUNTS_FILE" || return 1
-    printf 'zone\ttype\tcategory\tbefore\tfake\tmode\tresult\n' > "$MAP_FILE" || return 1
+    rm -f "$skipped_map" "$failed_map" "$mounted_map" 2>/dev/null
+    : > "$skipped_map" || return 1
+    : > "$failed_map" || {
+        rm -f "$skipped_map"
+        return 1
+    }
+    : > "$mounted_map" || {
+        rm -f "$skipped_map" "$failed_map"
+        return 1
+    }
 
     for zone in /sys/class/thermal/thermal_zone*; do
         [ -e "$zone/temp" ] || continue
@@ -564,14 +595,14 @@ apply_thermal_zones() {
         category="$(classify_zone "$type")"
 
         if ! thermal_value_valid "$before"; then
-            printf '%s\t%s\t%s\t%s\t-\t%s\tskipped-invalid-value\n' "$name" "$type" "$category" "$before" "$mode" >> "$MAP_FILE"
+            map_write_csv_row "$skipped_map" "$name" "$type" "$category" "$before" "-" "$mode" "skipped-invalid-value"
             invalid=$((invalid + 1))
             skipped=$((skipped + 1))
             continue
         fi
 
         if ! category_enabled "$category"; then
-            printf '%s\t%s\t%s\t%s\t-\t%s\tdisabled-by-config\n' "$name" "$type" "$category" "$before" "$mode" >> "$MAP_FILE"
+            map_write_csv_row "$skipped_map" "$name" "$type" "$category" "$before" "-" "$mode" "disabled-by-config"
             skipped=$((skipped + 1))
             continue
         fi
@@ -585,8 +616,21 @@ apply_thermal_zones() {
             result=failed
             failed=$((failed + 1))
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$type" "$category" "$before" "$temp_milli" "$mode" "$result" >> "$MAP_FILE"
+        if [ "$result" = mounted ]; then
+            map_write_csv_row "$mounted_map" "$name" "$type" "$category" "$before" "$temp_milli" "$mode" "$result"
+        else
+            map_write_csv_row "$failed_map" "$name" "$type" "$category" "$before" "$temp_milli" "$mode" "$result"
+        fi
     done
+
+    {
+        printf '"zone","type","category","before","fake","mode","result"\n'
+        cat "$skipped_map" "$failed_map" "$mounted_map" 2>/dev/null
+    } > "$MAP_FILE" || {
+        rm -f "$skipped_map" "$failed_map" "$mounted_map"
+        return 1
+    }
+    rm -f "$skipped_map" "$failed_map" "$mounted_map"
 
     log INFO "thermal zone 应用完成：mounted=$mounted skipped=$skipped invalid=$invalid failed=$failed"
     if [ "$mounted" -gt 0 ]; then
@@ -1133,7 +1177,7 @@ apply_runtime() {
     wait_for_thermal_zones || return 1
 
     restore_fake_roots 2>/dev/null || true
-    rm -f "$ACTIVE_FILE" "$MOUNTS_FILE" "$MAP_FILE" 2>/dev/null
+    rm -f "$ACTIVE_FILE" "$MOUNTS_FILE" "$MAP_FILE" "$STATE_DIR/thermal-map.tsv" 2>/dev/null
     prepare_fake_roots || {
         log ERROR "伪造文件 context tmpfs 初始化失败"
         return 1
