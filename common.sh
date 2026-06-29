@@ -71,6 +71,7 @@ load_config() {
     VERIFY_AFTER_APPLY=1
     ADB_WIFI_ENABLE=1
     ADB_WIFI_PORT=5555
+    ADB_WIFI_DELAY_SEC=10
 
     [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 }
@@ -153,6 +154,10 @@ validate_config() {
             return 1
         }
     fi
+    is_uint_range "$ADB_WIFI_DELAY_SEC" 0 300 || {
+        log ERROR "ADB_WIFI_DELAY_SEC 必须是 0～300 的整数，当前为 $ADB_WIFI_DELAY_SEC"
+        return 1
+    }
     return 0
 }
 
@@ -1186,6 +1191,10 @@ disable_adb_wifi() {
 }
 
 apply_adb_wifi() {
+    if [ "${ADB_WIFI_DELAY_SEC:-0}" -gt 0 ]; then
+        log INFO "等待 ${ADB_WIFI_DELAY_SEC}s 后配置无线调试"
+        sleep "$ADB_WIFI_DELAY_SEC"
+    fi
     if [ "$ADB_WIFI_ENABLE" = 1 ]; then
         enable_adb_wifi
     else
