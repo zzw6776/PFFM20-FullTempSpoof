@@ -1,11 +1,10 @@
-# PFFM20 Full Temperature Spoof
+# ColorOS Full Temperature Spoof
 
-默认配置基于当前实测设备：
+面向 ColorOS 的动态温度读数伪装模块。
 
-- 型号：PFFM20
-- 平台：MT6983
-- Android：12
-- 内核：5.10.66-android12-9-00001-g83cbf18b7dcd-ab8546841
+模块不绑定具体机型、Android 版本、内核版本或 SoC 平台；运行时会自动枚举当前设备实际存在的
+thermal zone、power_supply 温度节点和厂商温控服务，并按 `config.conf` 进行 best-effort 处理。
+不支持的节点、SELinux 标签或服务会跳过并记录日志。
 
 ## 工作方式
 
@@ -14,11 +13,11 @@
 1. 检查冲突模块；不校验机型、Android 版本或内核版本。
 2. 枚举 `/sys/class/thermal/thermal_zone*`。
 3. 根据 `type` 分类并从 `config.conf` 读取目标温度。
-4. 按目标节点 SELinux 标签在 `/dev/pffm20_fulltempspoof` 下动态创建独立 tmpfs，
+4. 按目标节点 SELinux 标签在 `/dev/coloros_fulltempspoof` 下动态创建独立 tmpfs，
    分别保存不同标签对应的伪造文件。
 5. 将伪造文件 bind mount 到每个 `thermal_zoneN/temp`。
 6. 可选处理电池 power_supply 温度与 `/proc/shell-temp`。
-7. 根据配置动态处理当前设备存在的 Horae、MTK、Qualcomm 温控服务。
+7. 厂商温控服务按单独配置项处理；默认全部 `keep`，不停止、不重启。
 8. 验证每个节点并生成映射表后退出，不驻留后台。
 
 跨设备使用时，模块采用 best-effort 策略：安装阶段会预检查并显示预计会跳过的
@@ -87,9 +86,9 @@ trip_point_0_temp=116500
 ## 运行时文件
 
 ```text
-/data/adb/pffm20_fulltempspoof/module.log
-/data/adb/pffm20_fulltempspoof/thermal-map.csv
-/data/adb/pffm20_fulltempspoof/mounts.tsv
+/data/adb/coloros_fulltempspoof/module.log
+/data/adb/coloros_fulltempspoof/thermal-map.csv
+/data/adb/coloros_fulltempspoof/mounts.tsv
 ```
 
 ## 冲突
@@ -104,6 +103,7 @@ trip_point_0_temp=116500
 
 ## 风险边界
 
-默认配置会伪装包括电池、PMIC、充电器和 soc_max 在内的全部温度入口，
-并按统一服务模式处理当前设备存在的 Horae、MTK 或 Qualcomm 温控服务。内核 116.5°C critical 是最后保护，
+默认配置会伪装包括电池、PMIC、充电器和 soc_max 在内的全部温度入口。
+Horae、MTK 或 Qualcomm 厂商温控服务默认均为 `keep`，不会被停止或重启；只有手动把对应
+`*_SERVICE_MODE` 改为 `stop`、`restart` 或 `stop_then_restart` 后才会处理。内核 116.5°C critical 是最后保护，
 并不是适合长期触发的工作温度；电池、充电 IC 或其他硬件也可能在到达该阈值前受损。

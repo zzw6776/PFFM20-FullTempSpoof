@@ -1,8 +1,8 @@
 #!/system/bin/sh
 
 MODDIR="${0%/*}"
-STATE_DIR="/data/adb/pffm20_fulltempspoof"
-FAKE_ROOT="/dev/pffm20_fulltempspoof"
+STATE_DIR="/data/adb/coloros_fulltempspoof"
+FAKE_ROOT="/dev/coloros_fulltempspoof"
 result=0
 used_common=0
 

@@ -53,7 +53,7 @@ validate_config || {
 }
 
 echo "========================================"
-echo "  PFFM20 温度传感器状态"
+echo "  ColorOS 温度传感器状态"
 echo "========================================"
 echo ""
 
@@ -174,12 +174,11 @@ echo ""
 echo "----------------------------------------"
 echo "  厂商温控服务状态"
 echo "----------------------------------------"
-horae_state="$(getprop init.svc.horae 2>/dev/null)"
-echo "  统一服务模式:       ${THERMAL_SERVICES_MODE:-未知}"
+echo "  每个服务按 config.conf 中对应 *_SERVICE_MODE 独立处理"
 for svc in $(thermal_service_candidates); do
     state="$(getprop init.svc."$svc" 2>/dev/null)"
     [ -n "$state" ] || continue
-    echo "  $svc: $state"
+    echo "  $svc: $state，配置 $(service_mode_for "$svc")"
 done
 
 # ---- 用最新配置重新应用伪装 ----

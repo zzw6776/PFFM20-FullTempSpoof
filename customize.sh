@@ -1,14 +1,14 @@
 #!/system/bin/sh
 
 ui_print "*******************************"
-ui_print " PFFM20 Full Temperature Spoof "
+ui_print " ColorOS Full Temperature Spoof "
 ui_print "*******************************"
-ui_print "基准设备：PFFM20 / MT6983，当前版本使用动态兼容模式"
+ui_print "面向 ColorOS 的动态温度读数伪装模块"
 ui_print "不限制机型、Android 版本或内核版本；发现什么节点就处理什么节点"
 ui_print "运行时按 config.conf 分类伪装 thermal / power_supply 温度读数"
 ui_print "不修改 XML、thermal.conf、CPU 频率、cooling device 或 live sepolicy"
 ui_print "不支持的节点、标签或服务会自动跳过，并记录到 module.log"
-ui_print "配置文件：config.conf；日志目录：/data/adb/pffm20_fulltempspoof"
+ui_print "配置文件：config.conf；日志目录：/data/adb/coloros_fulltempspoof"
 ui_print "注意：本模块只改变用户空间读数，内核 critical 保护仍由系统负责"
 
 load_install_config() {
@@ -18,7 +18,14 @@ load_install_config() {
     THERMAL_VALUE_FILTER_ENABLE=1
     THERMAL_VALID_MIN_MILLI_C=10000
     THERMAL_VALID_MAX_MILLI_C=130000
-    THERMAL_SERVICES_MODE=stop_then_restart
+    HORAE_SERVICE_MODE=keep
+    MTK_THERMAL_HAL_SERVICE_MODE=keep
+    THERMAL_CORE_SERVICE_MODE=keep
+    THERMAL_ENGINE_SERVICE_MODE=keep
+    QTI_THERMAL_ENGINE_SERVICE_MODE=keep
+    VENDOR_THERMAL_HAL_SERVICE_MODE=keep
+    VENDOR_THERMAL_HAL_AIDL_SERVICE_MODE=keep
+    VENDOR_THERMAL_HAL_2_0_SERVICE_MODE=keep
     [ -r "$MODPATH/config.conf" ] && . "$MODPATH/config.conf"
 }
 
@@ -134,8 +141,23 @@ install_thermal_service_candidates() {
         vendor.thermal-hal-2-0
 }
 
+install_service_mode_for() {
+    case "$1" in
+        horae) printf '%s\n' "${HORAE_SERVICE_MODE:-keep}" ;;
+        vendor.thermal-hal-2-0.mtk) printf '%s\n' "${MTK_THERMAL_HAL_SERVICE_MODE:-keep}" ;;
+        thermal_core) printf '%s\n' "${THERMAL_CORE_SERVICE_MODE:-keep}" ;;
+        thermal-engine) printf '%s\n' "${THERMAL_ENGINE_SERVICE_MODE:-keep}" ;;
+        qti.thermal-engine) printf '%s\n' "${QTI_THERMAL_ENGINE_SERVICE_MODE:-keep}" ;;
+        vendor.thermal-hal) printf '%s\n' "${VENDOR_THERMAL_HAL_SERVICE_MODE:-keep}" ;;
+        vendor.thermal-hal-aidl) printf '%s\n' "${VENDOR_THERMAL_HAL_AIDL_SERVICE_MODE:-keep}" ;;
+        vendor.thermal-hal-2-0) printf '%s\n' "${VENDOR_THERMAL_HAL_2_0_SERVICE_MODE:-keep}" ;;
+        *) printf '%s\n' keep ;;
+    esac
+}
+
 install_preflight() {
-    local zone count=0 unsupported=0 supported=0 invalid=0 context type real raw p service found_service=0
+    local zone count=0 unsupported=0 supported=0 invalid=0 context type real raw p service state mode
+    local found_service=0 configured_service=0
     local min_c max_c
     INSTALL_SKIP_COUNT=0
     load_install_config
@@ -148,7 +170,7 @@ install_preflight() {
     else
         ui_print "  数值过滤：已关闭，匹配到的温度节点都会尝试处理"
     fi
-    ui_print "  服务模式：${THERMAL_SERVICES_MODE}"
+    ui_print "  温控服务：默认均为 keep；只有单项配置为 stop/restart/stop_then_restart 才会处理"
     for zone in /sys/class/thermal/thermal_zone*; do
         [ -e "$zone/temp" ] || continue
         count=$((count + 1))
@@ -203,15 +225,30 @@ install_preflight() {
         install_print_skip "/proc/shell-temp：不存在或不可写"
     fi
 
-    if [ "$THERMAL_SERVICES_MODE" != keep ]; then
-        for service in $(install_thermal_service_candidates); do
-            if [ -n "$(getprop init.svc."$service" 2>/dev/null)" ]; then
-                found_service=1
-                ui_print "  温控服务：发现 $service，将按 ${THERMAL_SERVICES_MODE} 处理"
-            fi
-        done
-        [ "$found_service" -eq 1 ] || install_print_skip "温控服务：未发现候选服务，运行时跳过服务处理"
-    fi
+    for service in $(install_thermal_service_candidates); do
+        mode="$(install_service_mode_for "$service")"
+        case "$mode" in
+            keep|stop|restart|stop_then_restart) ;;
+            *)
+                install_print_skip "温控服务 $service：配置值无效 ($mode)，运行时会拒绝应用"
+                continue
+                ;;
+        esac
+        state="$(getprop init.svc."$service" 2>/dev/null)"
+        [ -n "$state" ] && found_service=1
+        if [ "$mode" = keep ]; then
+            [ -n "$state" ] && ui_print "  温控服务：发现 $service，配置为 keep，不处理"
+            continue
+        fi
+        configured_service=1
+        if [ -n "$state" ]; then
+            ui_print "  温控服务：发现 $service，将按 $mode 处理"
+        else
+            install_print_skip "温控服务 $service：配置为 $mode，但当前设备未发现该服务"
+        fi
+    done
+    [ "$found_service" -eq 1 ] || install_print_skip "温控服务：未发现候选服务，运行时跳过服务处理"
+    [ "$configured_service" -eq 1 ] || ui_print "  温控服务：未配置任何 stop/restart，运行时不会触碰厂商温控服务"
 
     if [ "$INSTALL_SKIP_COUNT" -eq 0 ]; then
         ui_print "  预检查结果：未发现预计跳过项"

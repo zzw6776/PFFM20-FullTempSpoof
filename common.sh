@@ -2,8 +2,8 @@
 
 MODDIR="${MODDIR:-${0%/*}}"
 CONFIG_FILE="$MODDIR/config.conf"
-STATE_DIR="/data/adb/pffm20_fulltempspoof"
-FAKE_ROOT="/dev/pffm20_fulltempspoof"
+STATE_DIR="/data/adb/coloros_fulltempspoof"
+FAKE_ROOT="/dev/coloros_fulltempspoof"
 LOG_FILE="$STATE_DIR/module.log"
 MOUNTS_FILE="$STATE_DIR/mounts.tsv"
 MAP_FILE="$STATE_DIR/thermal-map.csv"
@@ -59,7 +59,14 @@ load_config() {
 
     POWER_SUPPLY_BATTERY_ENABLE=1
     PROC_SHELL_TEMP_ENABLE=1
-    THERMAL_SERVICES_MODE=stop_then_restart
+    HORAE_SERVICE_MODE=keep
+    MTK_THERMAL_HAL_SERVICE_MODE=keep
+    THERMAL_CORE_SERVICE_MODE=keep
+    THERMAL_ENGINE_SERVICE_MODE=keep
+    QTI_THERMAL_ENGINE_SERVICE_MODE=keep
+    VENDOR_THERMAL_HAL_SERVICE_MODE=keep
+    VENDOR_THERMAL_HAL_AIDL_SERVICE_MODE=keep
+    VENDOR_THERMAL_HAL_2_0_SERVICE_MODE=keep
     CONFLICT_CHECK=1
     VERIFY_AFTER_APPLY=1
     ADB_WIFI_ENABLE=1
@@ -113,10 +120,17 @@ validate_config() {
         }
     done
 
-    case "$THERMAL_SERVICES_MODE" in
-        stop_then_restart|stop|restart|keep) ;;
-        *) log ERROR "THERMAL_SERVICES_MODE 只能为 stop_then_restart/stop/restart/keep"; return 1 ;;
-    esac
+    for key in HORAE_SERVICE_MODE MTK_THERMAL_HAL_SERVICE_MODE \
+        THERMAL_CORE_SERVICE_MODE THERMAL_ENGINE_SERVICE_MODE \
+        QTI_THERMAL_ENGINE_SERVICE_MODE VENDOR_THERMAL_HAL_SERVICE_MODE \
+        VENDOR_THERMAL_HAL_AIDL_SERVICE_MODE \
+        VENDOR_THERMAL_HAL_2_0_SERVICE_MODE; do
+        eval "value=\${$key}"
+        case "$value" in
+            keep|stop|restart|stop_then_restart) ;;
+            *) log ERROR "配置错误：$key 只能为 keep/stop/restart/stop_then_restart，当前为 $value"; return 1 ;;
+        esac
+    done
     is_uint_range "$WAIT_TIMEOUT_SEC" 1 600 || {
         log ERROR "WAIT_TIMEOUT_SEC 必须是 1～600 的整数"
         return 1
@@ -788,8 +802,32 @@ thermal_service_candidates() {
         vendor.thermal-hal-2-0
 }
 
+service_mode_for() {
+    case "$1" in
+        horae) printf '%s\n' "${HORAE_SERVICE_MODE:-keep}" ;;
+        vendor.thermal-hal-2-0.mtk) printf '%s\n' "${MTK_THERMAL_HAL_SERVICE_MODE:-keep}" ;;
+        thermal_core) printf '%s\n' "${THERMAL_CORE_SERVICE_MODE:-keep}" ;;
+        thermal-engine) printf '%s\n' "${THERMAL_ENGINE_SERVICE_MODE:-keep}" ;;
+        qti.thermal-engine) printf '%s\n' "${QTI_THERMAL_ENGINE_SERVICE_MODE:-keep}" ;;
+        vendor.thermal-hal) printf '%s\n' "${VENDOR_THERMAL_HAL_SERVICE_MODE:-keep}" ;;
+        vendor.thermal-hal-aidl) printf '%s\n' "${VENDOR_THERMAL_HAL_AIDL_SERVICE_MODE:-keep}" ;;
+        vendor.thermal-hal-2-0) printf '%s\n' "${VENDOR_THERMAL_HAL_2_0_SERVICE_MODE:-keep}" ;;
+        *) printf '%s\n' keep ;;
+    esac
+}
+
 service_exists() {
     [ -n "$(getprop init.svc."$1" 2>/dev/null)" ]
+}
+
+service_actions_configured() {
+    local service
+    for service in $(thermal_service_candidates); do
+        service_exists "$service" || continue
+        [ "$(service_mode_for "$service")" = keep ] && continue
+        return 0
+    done
+    return 1
 }
 
 load_runtime_state_file() {
@@ -943,10 +981,12 @@ restart_init_service() {
 }
 
 apply_service_mode() {
-    local service="$1" result=0
+    local service="$1" mode result=0
     service_exists "$service" || return 0
-    case "$THERMAL_SERVICES_MODE" in
+    mode="$(service_mode_for "$service")"
+    case "$mode" in
         keep)
+            log INFO "服务 $service 配置为 keep，跳过处理"
             return 0
             ;;
         stop)
@@ -967,12 +1007,16 @@ apply_service_mode() {
 
 apply_private_services() {
     local result=0 service
+    service_actions_configured || {
+        log INFO "厂商私有温控服务均为 keep 或当前设备不存在，跳过服务处理"
+        return 0
+    }
     backup_runtime_state || {
         log ERROR "备份服务运行状态失败"
         return 1
     }
 
-    case "$THERMAL_SERVICES_MODE" in
+    case "$(service_mode_for horae)" in
         stop|stop_then_restart)
             if service_exists horae; then
                 if command -v resetprop >/dev/null 2>&1; then
@@ -1007,9 +1051,8 @@ service_state_is() {
 }
 
 services_configured() {
-    local result=0 state service
-    [ "$THERMAL_SERVICES_MODE" = keep ] && return 0
-    case "$THERMAL_SERVICES_MODE" in
+    local result=0 state service mode
+    case "$(service_mode_for horae)" in
         stop|stop_then_restart)
             if service_exists horae; then
                 [ "$(getprop persist.sys.horae.enable 2>/dev/null)" = 0 ] || result=1
@@ -1019,7 +1062,9 @@ services_configured() {
     for service in $(thermal_service_candidates); do
         state="$(getprop init.svc."$service" 2>/dev/null)"
         [ -n "$state" ] || continue
-        case "$THERMAL_SERVICES_MODE" in
+        mode="$(service_mode_for "$service")"
+        case "$mode" in
+            keep) ;;
             stop) [ "$state" = stopped ] || result=1 ;;
             restart) [ "$state" = running ] || result=1 ;;
             stop_then_restart) case "$state" in stopped|running) ;; *) result=1 ;; esac ;;
