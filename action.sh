@@ -38,6 +38,7 @@ category_name_cn() {
         BATTERY)      echo "电池" ;;
         CHARGER)      echo "充电器" ;;
         PMIC)         echo "电源管理芯片 (PMIC)" ;;
+        DYNAMIC_RADIO) echo "动态射频 / 基带" ;;
         MODEM_RF)     echo "基带 / 射频" ;;
         CONNECTIVITY) echo "连接子系统 (WiFi/蓝牙)" ;;
         NTC_AMBIENT)  echo "环境 / NTC 温度" ;;
@@ -96,18 +97,22 @@ for zone in /sys/class/thermal/thermal_zone*; do
     category="$(classify_zone "$type")"
     cat_cn="$(category_name_cn "$category")"
 
-    # 真实温度：毫摄氏度 -> 摄氏度
+    # 真实温度：常规 thermal zone 为毫摄氏度；socd 使用摄氏度整数。
     if [ "$temp_raw" != "-" ] && [ "$temp_raw" != "0" ] 2>/dev/null; then
-        real_c="$(awk "BEGIN { printf \"%.1f\", $temp_raw / 1000 }")"
+        if thermal_type_uses_celsius_unit "$type"; then
+            real_c="$(awk "BEGIN { printf \"%.1f\", $temp_raw }")"
+        else
+            real_c="$(awk "BEGIN { printf \"%.1f\", $temp_raw / 1000 }")"
+        fi
     else
         real_c="$temp_raw"
     fi
 
     # 伪装目标温度
-    if ! thermal_value_valid "$temp_raw"; then
+    if ! thermal_value_valid_for_type "$type" "$temp_raw"; then
         tag="[当前值不在正常温度范围，运行时跳过]"
-    elif category_enabled "$category"; then
-        target_c="$(category_temp_c "$category")"
+    elif thermal_target_enabled_for_type "$type" "$category"; then
+        target_c="$(thermal_target_temp_c_for_type "$type" "$category")"
         tag="-> 伪装 ${target_c}°C"
     else
         tag="[配置为不伪装]"

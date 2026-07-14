@@ -12,7 +12,6 @@ if [ -r "$MODDIR/common.sh" ]; then
     if acquire_lock; then
         trap 'release_lock' EXIT
         restore_runtime || result=1
-        disable_adb_wifi || result=1
     else
         log ERROR "卸载时无法获取运行锁，保留运行时状态供重试"
         result=1
@@ -179,19 +178,6 @@ else
             printf '%s %s\n' "$i" 0 > /proc/shell-temp 2>/dev/null || result=1
             i=$((i + 1))
         done
-    fi
-
-    if command -v resetprop >/dev/null 2>&1; then
-        resetprop --delete service.adb.tcp.port 2>/dev/null || {
-            [ -z "$(getprop service.adb.tcp.port)" ] || result=1
-        }
-        setprop ctl.stop adbd 2>/dev/null || result=1
-        sleep 1
-        setprop ctl.start adbd 2>/dev/null || result=1
-        sleep 1
-        [ -z "$(getprop service.adb.tcp.port)" ] || result=1
-    else
-        result=1
     fi
 
     restore_runtime_services_fallback || result=1

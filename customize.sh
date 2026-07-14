@@ -18,7 +18,6 @@ load_install_config() {
     THERMAL_VALUE_FILTER_ENABLE=1
     THERMAL_VALID_MIN_MILLI_C=10000
     THERMAL_VALID_MAX_MILLI_C=130000
-    ADB_WIFI_DELAY_SEC=10
     HORAE_SERVICE_MODE=keep
     MTK_THERMAL_HAL_SERVICE_MODE=keep
     THERMAL_CORE_SERVICE_MODE=keep
@@ -113,6 +112,26 @@ install_thermal_value_valid() {
         [ "$value" -le "$THERMAL_VALID_MAX_MILLI_C" ]
 }
 
+install_thermal_type_uses_celsius_unit() {
+    local type
+    type="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    [ "$type" = socd ]
+}
+
+install_thermal_value_valid_for_type() {
+    local type="$1" value="$2" min max
+    if ! install_thermal_type_uses_celsius_unit "$type"; then
+        install_thermal_value_valid "$value"
+        return $?
+    fi
+
+    [ "${THERMAL_VALUE_FILTER_ENABLE:-1}" = 1 ] || return 0
+    install_signed_int "$value" || return 1
+    min="$(install_valid_min_c)"
+    max="$(install_valid_max_c)"
+    [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]
+}
+
 install_power_value_valid() {
     local path="$1" value="$2" min max
     [ "${THERMAL_VALUE_FILTER_ENABLE:-1}" = 1 ] || return 0
@@ -186,7 +205,7 @@ install_preflight() {
             if [ "$unsupported" -le 5 ]; then
                 install_print_skip "${zone##*/} $type：SELinux 标签未适配 (${context:-unknown})"
             fi
-        elif ! install_thermal_value_valid "$raw"; then
+        elif ! install_thermal_value_valid_for_type "$type" "$raw"; then
             invalid=$((invalid + 1))
             if [ "$invalid" -le 5 ]; then
                 install_print_skip "${zone##*/} $type：当前值 $raw 超出过滤范围，运行时跳过"

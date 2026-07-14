@@ -38,24 +38,26 @@ log() {
 
 load_config() {
     MASTER_ENABLE=1
+    BOOT_WAIT_TIMEOUT_SEC=300
     WAIT_TIMEOUT_SEC=120
     THERMAL_VALUE_FILTER_ENABLE=1
     THERMAL_VALID_MIN_MILLI_C=10000
     THERMAL_VALID_MAX_MILLI_C=130000
 
-    CPU_ENABLE=1; CPU_TEMP_C=40
-    GPU_ENABLE=1; GPU_TEMP_C=40
-    APU_NPU_ENABLE=1; APU_NPU_TEMP_C=40
-    MEMORY_ENABLE=1; MEMORY_TEMP_C=40
-    SOC_ENABLE=1; SOC_TEMP_C=40
-    SHELL_SKIN_ENABLE=1; SHELL_SKIN_TEMP_C=36
+    CPU_ENABLE=1; CPU_TEMP_C=30
+    GPU_ENABLE=1; GPU_TEMP_C=30
+    APU_NPU_ENABLE=1; APU_NPU_TEMP_C=30
+    MEMORY_ENABLE=1; MEMORY_TEMP_C=30
+    SOC_ENABLE=1; SOC_TEMP_C=30
+    SHELL_SKIN_ENABLE=1; SHELL_SKIN_TEMP_C=30
     BATTERY_ENABLE=1; BATTERY_TEMP_C=30
-    CHARGER_ENABLE=1; CHARGER_TEMP_C=35
-    PMIC_ENABLE=1; PMIC_TEMP_C=40
-    MODEM_RF_ENABLE=1; MODEM_RF_TEMP_C=40
-    CONNECTIVITY_ENABLE=1; CONNECTIVITY_TEMP_C=40
-    NTC_AMBIENT_ENABLE=1; NTC_AMBIENT_TEMP_C=36
-    UNKNOWN_ENABLE=1; UNKNOWN_TEMP_C=40
+    CHARGER_ENABLE=1; CHARGER_TEMP_C=30
+    PMIC_ENABLE=1; PMIC_TEMP_C=30
+    DYNAMIC_RADIO_ENABLE=0; DYNAMIC_RADIO_TEMP_C=30
+    MODEM_RF_ENABLE=1; MODEM_RF_TEMP_C=30
+    CONNECTIVITY_ENABLE=1; CONNECTIVITY_TEMP_C=30
+    NTC_AMBIENT_ENABLE=1; NTC_AMBIENT_TEMP_C=30
+    UNKNOWN_ENABLE=1; UNKNOWN_TEMP_C=30
 
     POWER_SUPPLY_BATTERY_ENABLE=1
     PROC_SHELL_TEMP_ENABLE=1
@@ -69,9 +71,6 @@ load_config() {
     VENDOR_THERMAL_HAL_2_0_SERVICE_MODE=keep
     CONFLICT_CHECK=1
     VERIFY_AFTER_APPLY=1
-    ADB_WIFI_ENABLE=1
-    ADB_WIFI_PORT=5555
-    ADB_WIFI_DELAY_SEC=10
 
     [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 }
@@ -98,11 +97,10 @@ validate_config() {
     local key value
     for key in MASTER_ENABLE CPU_ENABLE GPU_ENABLE \
         APU_NPU_ENABLE MEMORY_ENABLE SOC_ENABLE SHELL_SKIN_ENABLE \
-        BATTERY_ENABLE CHARGER_ENABLE PMIC_ENABLE MODEM_RF_ENABLE \
+        BATTERY_ENABLE CHARGER_ENABLE PMIC_ENABLE DYNAMIC_RADIO_ENABLE MODEM_RF_ENABLE \
         CONNECTIVITY_ENABLE NTC_AMBIENT_ENABLE UNKNOWN_ENABLE \
         POWER_SUPPLY_BATTERY_ENABLE PROC_SHELL_TEMP_ENABLE \
-        THERMAL_VALUE_FILTER_ENABLE CONFLICT_CHECK VERIFY_AFTER_APPLY \
-        ADB_WIFI_ENABLE; do
+        THERMAL_VALUE_FILTER_ENABLE CONFLICT_CHECK VERIFY_AFTER_APPLY; do
         eval "value=\${$key}"
         is_bool "$value" || {
             log ERROR "配置错误：$key 必须为 0 或 1，当前为 $value"
@@ -112,7 +110,7 @@ validate_config() {
 
     for key in CPU_TEMP_C GPU_TEMP_C APU_NPU_TEMP_C MEMORY_TEMP_C \
         SOC_TEMP_C SHELL_SKIN_TEMP_C BATTERY_TEMP_C CHARGER_TEMP_C \
-        PMIC_TEMP_C MODEM_RF_TEMP_C CONNECTIVITY_TEMP_C \
+        PMIC_TEMP_C DYNAMIC_RADIO_TEMP_C MODEM_RF_TEMP_C CONNECTIVITY_TEMP_C \
         NTC_AMBIENT_TEMP_C UNKNOWN_TEMP_C; do
         eval "value=\${$key}"
         is_temp "$value" || {
@@ -132,6 +130,10 @@ validate_config() {
             *) log ERROR "配置错误：$key 只能为 keep/stop/restart/stop_then_restart，当前为 $value"; return 1 ;;
         esac
     done
+    is_uint_range "$BOOT_WAIT_TIMEOUT_SEC" 1 1800 || {
+        log ERROR "BOOT_WAIT_TIMEOUT_SEC 必须是 1～1800 的整数"
+        return 1
+    }
     is_uint_range "$WAIT_TIMEOUT_SEC" 1 600 || {
         log ERROR "WAIT_TIMEOUT_SEC 必须是 1～600 的整数"
         return 1
@@ -148,17 +150,32 @@ validate_config() {
         log ERROR "THERMAL_VALID_MIN_MILLI_C 必须小于 THERMAL_VALID_MAX_MILLI_C"
         return 1
     }
-    if [ "$ADB_WIFI_ENABLE" = 1 ]; then
-        is_uint_range "$ADB_WIFI_PORT" 1024 65535 || {
-            log ERROR "ADB_WIFI_PORT 必须是 1024～65535 的整数，当前为 $ADB_WIFI_PORT"
-            return 1
-        }
-    fi
-    is_uint_range "$ADB_WIFI_DELAY_SEC" 0 300 || {
-        log ERROR "ADB_WIFI_DELAY_SEC 必须是 0～300 的整数，当前为 $ADB_WIFI_DELAY_SEC"
-        return 1
-    }
     return 0
+}
+
+node_key_for_type() {
+    printf '%s' "$1" \
+        | tr '[:lower:]' '[:upper:]' \
+        | sed 's/[^A-Z0-9_]/_/g'
+}
+
+node_config_enabled() {
+    local type="$1" key value
+    key="$(node_key_for_type "$type")"
+    eval "value=\${NODE_${key}_ENABLE:-}"
+    [ -n "$value" ] || return 2
+    [ "$value" = 1 ]
+}
+
+node_config_temp_c() {
+    local type="$1" key value
+    key="$(node_key_for_type "$type")"
+    eval "value=\${NODE_${key}_TEMP_C:-}"
+    if is_temp "$value"; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+    return 1
 }
 
 module_is_active() {
@@ -223,6 +240,7 @@ classify_zone() {
         *battery*|batt*|bms*) echo BATTERY ;;
         *charger*|usb-therm*|vbat*|ibat*) echo CHARGER ;;
         pmic*|pm[0-9]*|pmi*|pmr*|pmxr*|pmk*|xo|xo-*|pa-therm*) echo PMIC ;;
+        sdr0|sdr0_pa|mmw_ific0) echo DYNAMIC_RADIO ;;
         md[0-9]*|*ltepa*|*nrpa*|*antenna*|*sub6*|*rfc*|*rf-*|*mmw*|*qtm*|*nss*|*wcn*) echo MODEM_RF ;;
         consys*|wlan*|wifi*|wcss*) echo CONNECTIVITY ;;
         *ntc*|ambient*|board*|quiet*|rear*|cam*) echo NTC_AMBIENT ;;
@@ -241,6 +259,7 @@ category_enabled() {
         BATTERY) [ "$BATTERY_ENABLE" = 1 ] ;;
         CHARGER) [ "$CHARGER_ENABLE" = 1 ] ;;
         PMIC) [ "$PMIC_ENABLE" = 1 ] ;;
+        DYNAMIC_RADIO) [ "$DYNAMIC_RADIO_ENABLE" = 1 ] ;;
         MODEM_RF) [ "$MODEM_RF_ENABLE" = 1 ] ;;
         CONNECTIVITY) [ "$CONNECTIVITY_ENABLE" = 1 ] ;;
         NTC_AMBIENT) [ "$NTC_AMBIENT_ENABLE" = 1 ] ;;
@@ -260,11 +279,27 @@ category_temp_c() {
         BATTERY) echo "$BATTERY_TEMP_C" ;;
         CHARGER) echo "$CHARGER_TEMP_C" ;;
         PMIC) echo "$PMIC_TEMP_C" ;;
+        DYNAMIC_RADIO) echo "$DYNAMIC_RADIO_TEMP_C" ;;
         MODEM_RF) echo "$MODEM_RF_TEMP_C" ;;
         CONNECTIVITY) echo "$CONNECTIVITY_TEMP_C" ;;
         NTC_AMBIENT) echo "$NTC_AMBIENT_TEMP_C" ;;
         UNKNOWN) echo "$UNKNOWN_TEMP_C" ;;
     esac
+}
+
+thermal_target_enabled_for_type() {
+    local type="$1" category="$2"
+    node_config_enabled "$type"
+    case "$?" in
+        0) return 0 ;;
+        1) return 1 ;;
+    esac
+    category_enabled "$category"
+}
+
+thermal_target_temp_c_for_type() {
+    local type="$1" category="$2"
+    node_config_temp_c "$type" || category_temp_c "$category"
 }
 
 signed_int() {
@@ -286,6 +321,35 @@ thermal_value_valid() {
     signed_int "$value" || return 1
     [ "$value" -ge "$THERMAL_VALID_MIN_MILLI_C" ] && \
         [ "$value" -le "$THERMAL_VALID_MAX_MILLI_C" ]
+}
+
+thermal_type_uses_celsius_unit() {
+    local type
+    type="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    [ "$type" = socd ]
+}
+
+thermal_value_valid_for_type() {
+    local type="$1" value="$2" min max
+    if ! thermal_type_uses_celsius_unit "$type"; then
+        thermal_value_valid "$value"
+        return $?
+    fi
+
+    [ "${THERMAL_VALUE_FILTER_ENABLE:-1}" = 1 ] || return 0
+    signed_int "$value" || return 1
+    min="$(valid_min_c)"
+    max="$(valid_max_c)"
+    [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]
+}
+
+thermal_fake_value_for_type() {
+    local type="$1" temp_c="$2"
+    if thermal_type_uses_celsius_unit "$type"; then
+        printf '%s\n' "$temp_c"
+        return 0
+    fi
+    printf '%s\n' $((temp_c * 1000))
 }
 
 valid_min_c() {
@@ -415,11 +479,11 @@ expected_runtime_targets() {
     for zone in /sys/class/thermal/thermal_zone*; do
         [ -e "$zone/temp" ] || continue
         raw="$(cat "$zone/temp" 2>/dev/null | tr -d ' \r\n')"
-        thermal_value_valid "$raw" || continue
         type="$(cat "$zone/type" 2>/dev/null | tr -d '\r\n')"
         [ -n "$type" ] || type=unknown
+        thermal_value_valid_for_type "$type" "$raw" || continue
         category="$(classify_zone "$type")"
-        category_enabled "$category" || continue
+        thermal_target_enabled_for_type "$type" "$category" || continue
         target="$(readlink -f "$zone/temp" 2>/dev/null)"
         [ -n "$target" ] || target="$zone/temp"
         printf '%s\n' "$target"
@@ -448,14 +512,71 @@ runtime_tracked_mountpoints() {
     awk '$5 ~ /\/thermal_zone[0-9]+\/temp$/ || $5 ~ /\/power_supply\/.*\/temp$/ || $5 ~ /\/power_supply\/.*\/temperature$/ { print $5 }' /proc/self/mountinfo 2>/dev/null
 }
 
+runtime_tracked_mountpoints_present() {
+    runtime_tracked_mountpoints | awk 'NF { found=1; exit } END { exit !found }'
+}
+
 runtime_mounts_complete() {
-    local target source target_value source_value target_context source_context mounted source_root
+    local target source target_value source_value target_context source_context context_pair
+    local mountpoints_file tracked_file source_root
     local count=0 failed=0
     [ -s "$MOUNTS_FILE" ] || return 1
 
-    for mounted in $(runtime_tracked_mountpoints); do
-        mount_record_has_target "$mounted" || failed=1
-    done
+    mountpoints_file="$STATE_DIR/mountpoints.$$"
+    tracked_file="$STATE_DIR/tracked-mountpoints.$$"
+    awk '{ print $5 }' /proc/self/mountinfo > "$mountpoints_file" 2>/dev/null || {
+        rm -f "$mountpoints_file" "$tracked_file" 2>/dev/null
+        return 1
+    }
+    awk '$0 ~ /\/thermal_zone[0-9]+\/temp$/ || $0 ~ /\/power_supply\/.*\/temp$/ || $0 ~ /\/power_supply\/.*\/temperature$/ { print }' "$mountpoints_file" > "$tracked_file" 2>/dev/null || {
+        rm -f "$mountpoints_file" "$tracked_file" 2>/dev/null
+        return 1
+    }
+
+    awk -v FS="$TAB" '
+        NR == FNR {
+            if ($1 != "" && $2 != "") {
+                recorded[$1] = 1
+            }
+            next
+        }
+        NF && !($0 in recorded) {
+            failed = 1
+        }
+        END {
+            exit failed
+        }
+    ' "$MOUNTS_FILE" "$tracked_file" || failed=1
+
+    awk -v FS="$TAB" '
+        NR == FNR {
+            mountpoint[$0] = 1
+            next
+        }
+        {
+            target = $1
+            source = $2
+            if (target == "" || source == "") {
+                failed = 1
+                next
+            }
+            count += 1
+            source_root = source
+            sub("/[^/]*$", "", source_root)
+            if (!(target in mountpoint)) {
+                failed = 1
+            }
+            if (!(source_root in mountpoint)) {
+                failed = 1
+            }
+        }
+        END {
+            if (count <= 0) {
+                failed = 1
+            }
+            exit failed
+        }
+    ' "$mountpoints_file" "$MOUNTS_FILE" || failed=1
 
     while IFS="$TAB" read -r target source; do
         [ -n "$target" ] && [ -n "$source" ] || {
@@ -463,24 +584,20 @@ runtime_mounts_complete() {
             continue
         }
         count=$((count + 1))
-        is_exact_mountpoint "$target" || {
-            failed=1
-            continue
-        }
         [ -f "$source" ] || {
             failed=1
             continue
         }
-        source_root="${source%/*}"
-        is_exact_mountpoint "$source_root" || failed=1
         target_value="$(cat "$target" 2>/dev/null | tr -d ' \r\n')"
         source_value="$(cat "$source" 2>/dev/null | tr -d ' \r\n')"
-        target_context="$(get_selinux_context "$target")"
-        source_context="$(get_selinux_context "$source")"
+        context_pair="$(ls -Zd "$target" "$source" 2>/dev/null | awk -v tab="$TAB" 'NR == 1 { target = $1 } NR == 2 { source = $1 } END { printf "%s%s%s", target, tab, source }')"
+        target_context="${context_pair%%"$TAB"*}"
+        source_context="${context_pair#*"$TAB"}"
         [ "$target_value" = "$source_value" ] || failed=1
         [ -n "$source_context" ] && [ "$target_context" = "$source_context" ] || failed=1
     done < "$MOUNTS_FILE"
 
+    rm -f "$mountpoints_file" "$tracked_file" 2>/dev/null
     [ "$count" -gt 0 ] && [ "$failed" -eq 0 ]
 }
 
@@ -499,8 +616,9 @@ reconcile_runtime_state() {
         return $?
     fi
     if thermal_target_mounts_present; then
-        log ERROR "检测到无法追踪的 thermal bind mount；拒绝继续，需重启设备清理"
-        return 1
+        log WARN "检测到无法追踪的 thermal bind mount，尝试兜底恢复"
+        restore_runtime
+        return $?
     fi
 
     if [ -e "$ACTIVE_FILE" ] || [ -e "$MOUNTS_FILE" ]; then
@@ -586,7 +704,7 @@ map_write_csv_row() {
 }
 
 apply_thermal_zones() {
-    local zone name type category temp_c temp_milli before mode result mounted=0 skipped=0 failed=0 invalid=0
+    local zone name type category temp_c fake_value before mode result mounted=0 skipped=0 failed=0 invalid=0
     local skipped_map="$STATE_DIR/thermal-map.skipped.$$"
     local failed_map="$STATE_DIR/thermal-map.failed.$$"
     local mounted_map="$STATE_DIR/thermal-map.mounted.$$"
@@ -613,22 +731,22 @@ apply_thermal_zones() {
         [ -n "$mode" ] || mode=-
         category="$(classify_zone "$type")"
 
-        if ! thermal_value_valid "$before"; then
+        if ! thermal_value_valid_for_type "$type" "$before"; then
             map_write_csv_row "$skipped_map" "$name" "$type" "$category" "$before" "-" "$mode" "skipped-invalid-value"
             invalid=$((invalid + 1))
             skipped=$((skipped + 1))
             continue
         fi
 
-        if ! category_enabled "$category"; then
+        if ! thermal_target_enabled_for_type "$type" "$category"; then
             map_write_csv_row "$skipped_map" "$name" "$type" "$category" "$before" "-" "$mode" "disabled-by-config"
             skipped=$((skipped + 1))
             continue
         fi
 
-        temp_c="$(category_temp_c "$category")"
-        temp_milli=$((temp_c * 1000))
-        if bind_fake_value "$zone/temp" "${name}_temp" "$temp_milli"; then
+        temp_c="$(thermal_target_temp_c_for_type "$type" "$category")"
+        fake_value="$(thermal_fake_value_for_type "$type" "$temp_c")"
+        if bind_fake_value "$zone/temp" "${name}_temp" "$fake_value"; then
             result=mounted
             mounted=$((mounted + 1))
         else
@@ -636,9 +754,9 @@ apply_thermal_zones() {
             failed=$((failed + 1))
         fi
         if [ "$result" = mounted ]; then
-            map_write_csv_row "$mounted_map" "$name" "$type" "$category" "$before" "$temp_milli" "$mode" "$result"
+            map_write_csv_row "$mounted_map" "$name" "$type" "$category" "$before" "$fake_value" "$mode" "$result"
         else
-            map_write_csv_row "$failed_map" "$name" "$type" "$category" "$before" "$temp_milli" "$mode" "$result"
+            map_write_csv_row "$failed_map" "$name" "$type" "$category" "$before" "$fake_value" "$mode" "$result"
         fi
     done
 
@@ -661,7 +779,13 @@ apply_thermal_zones() {
 }
 
 power_supply_target_enabled() {
-    local path="$1" supply
+    local path="$1" supply node_type
+    node_type="$(power_supply_node_type "$path")"
+    node_config_enabled "$node_type"
+    case "$?" in
+        0) return 0 ;;
+        1) return 1 ;;
+    esac
     supply="${path#/sys/class/power_supply/}"
     supply="${supply%%/*}"
     case "$supply" in
@@ -670,15 +794,39 @@ power_supply_target_enabled() {
     esac
 }
 
-power_supply_target_value() {
+power_supply_node_type() {
     local path="$1" supply file
     supply="${path#/sys/class/power_supply/}"
     supply="${supply%%/*}"
     file="${path##*/}"
+    printf 'power_supply:%s/%s\n' "$supply" "$file"
+}
+
+power_supply_category() {
+    local path="$1" supply
+    supply="${path#/sys/class/power_supply/}"
+    supply="${supply%%/*}"
+    case "$supply" in
+        *battery*|*gauge*) printf '%s\n' BATTERY ;;
+        *) printf '%s\n' CHARGER ;;
+    esac
+}
+
+power_supply_target_value() {
+    local path="$1" supply file node_type override_c category temp_c
+    node_type="$(power_supply_node_type "$path")"
+    if override_c="$(node_config_temp_c "$node_type")"; then
+        temp_c="$override_c"
+    else
+        category="$(power_supply_category "$path")"
+        temp_c="$(category_temp_c "$category")"
+    fi
+    supply="${path#/sys/class/power_supply/}"
+    supply="${supply%%/*}"
+    file="${path##*/}"
     case "$supply/$file" in
-        mtk-battery/temperature) printf '%s\n' "$BATTERY_TEMP_C" ;;
-        *battery*/*|*gauge*/*) printf '%s\n' $((BATTERY_TEMP_C * 10)) ;;
-        *) printf '%s\n' $((CHARGER_TEMP_C * 10)) ;;
+        mtk-battery/temperature) printf '%s\n' "$temp_c" ;;
+        *) printf '%s\n' $((temp_c * 10)) ;;
     esac
 }
 
@@ -708,19 +856,25 @@ power_supply_source_name() {
 }
 
 apply_power_supply_battery() {
-    [ "$POWER_SUPPLY_BATTERY_ENABLE" = 1 ] || return 0
-    local target raw value name res=0 mounted=0 skipped=0 failed=0
+    local target raw value name type category res=0 mounted=0 skipped=0 failed=0
     for target in /sys/class/power_supply/*/temp /sys/class/power_supply/*/temperature; do
         [ -e "$target" ] || continue
-        power_supply_target_enabled "$target" || continue
         case "${target#/sys/class/power_supply/}" in
             *battery*/*|*gauge*/*) ;;
             *) continue ;;
         esac
+        type="$(power_supply_node_type "$target")"
+        category="$(power_supply_category "$target")"
+        if ! power_supply_target_enabled "$target"; then
+            map_write_csv_row "$MAP_FILE" "${target#/sys/class/}" "$type" "$category" "-" "-" "-" "disabled-by-config"
+            skipped=$((skipped + 1))
+            continue
+        fi
         raw="$(cat "$target" 2>/dev/null | tr -d ' \r\n')"
         if ! power_supply_value_valid "$target" "$raw"; then
             skipped=$((skipped + 1))
             log INFO "$target 当前值 $raw 不在正常温度范围，已跳过"
+            map_write_csv_row "$MAP_FILE" "${target#/sys/class/}" "$type" "$category" "$raw" "-" "-" "skipped-invalid-value"
             continue
         fi
         value="$(power_supply_target_value "$target")"
@@ -728,9 +882,11 @@ apply_power_supply_battery() {
         if bind_fake_value "$target" "$name" "$value"; then
             mounted=$((mounted + 1))
             log INFO "$target 已伪装为 $value"
+            map_write_csv_row "$MAP_FILE" "${target#/sys/class/}" "$type" "$category" "$raw" "$value" "-" "mounted"
         else
             failed=$((failed + 1))
             res=1
+            map_write_csv_row "$MAP_FILE" "${target#/sys/class/}" "$type" "$category" "$raw" "$value" "-" "failed"
         fi
     done
     log INFO "power_supply battery 动态应用完成：mounted=$mounted skipped=$skipped failed=$failed"
@@ -739,19 +895,25 @@ apply_power_supply_battery() {
 }
 
 apply_power_supply_charger() {
-    [ "${CHARGER_ENABLE:-1}" = 1 ] || return 0
-    local target raw value name res=0 mounted=0 skipped=0 failed=0
+    local target raw value name type category res=0 mounted=0 skipped=0 failed=0
 
     for target in /sys/class/power_supply/*/temp /sys/class/power_supply/*/temperature; do
         [ -e "$target" ] || continue
-        power_supply_target_enabled "$target" || continue
         case "${target#/sys/class/power_supply/}" in
             *battery*/*|*gauge*/*) continue ;;
         esac
+        type="$(power_supply_node_type "$target")"
+        category="$(power_supply_category "$target")"
+        if ! power_supply_target_enabled "$target"; then
+            map_write_csv_row "$MAP_FILE" "${target#/sys/class/}" "$type" "$category" "-" "-" "-" "disabled-by-config"
+            skipped=$((skipped + 1))
+            continue
+        fi
         raw="$(cat "$target" 2>/dev/null | tr -d ' \r\n')"
         if ! power_supply_value_valid "$target" "$raw"; then
             skipped=$((skipped + 1))
             log INFO "$target 当前值 $raw 不在正常温度范围，已跳过"
+            map_write_csv_row "$MAP_FILE" "${target#/sys/class/}" "$type" "$category" "$raw" "-" "-" "skipped-invalid-value"
             continue
         fi
         value="$(power_supply_target_value "$target")"
@@ -759,9 +921,11 @@ apply_power_supply_charger() {
         if bind_fake_value "$target" "$name" "$value"; then
             mounted=$((mounted + 1))
             log INFO "$target 已伪装为 $value"
+            map_write_csv_row "$MAP_FILE" "${target#/sys/class/}" "$type" "$category" "$raw" "$value" "-" "mounted"
         else
             failed=$((failed + 1))
             res=1
+            map_write_csv_row "$MAP_FILE" "${target#/sys/class/}" "$type" "$category" "$raw" "$value" "-" "failed"
         fi
     done
     log INFO "power_supply charger/usb/wireless 动态应用完成：mounted=$mounted skipped=$skipped failed=$failed"
@@ -1078,128 +1242,10 @@ services_configured() {
     return "$result"
 }
 
-restart_adbd() {
-    stop_init_service adbd || return 1
-    start_init_service adbd || return 1
-    return 0
-}
-
-adb_port_listening() {
-    local port="$1" port_hex
-    is_uint_range "$port" 1 65535 || return 1
-    if command -v ss >/dev/null 2>&1; then
-        ss -ltn 2>/dev/null | awk -v port=":$port" '{
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ port "$") found=1
-            }
-        } END { exit !found }' && return 0
-    fi
-    port_hex="$(awk -v port="$port" 'BEGIN { printf "%04X", port }' 2>/dev/null)"
-    [ -n "$port_hex" ] || return 1
-    awk -v port_hex="$port_hex" '
-        $2 ~ ":" port_hex "$" && $4 == "0A" { found=1 }
-        END { exit !found }
-    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
-}
-
-wait_adb_port_listening() {
-    local port="$1" tries=0
-    while [ "$tries" -lt 5 ]; do
-        adb_port_listening "$port" && return 0
-        sleep 1
-        tries=$((tries + 1))
-    done
-    return 1
-}
-
-wait_adb_port_closed() {
-    local port="$1" tries=0
-    while [ "$tries" -lt 5 ]; do
-        adb_port_listening "$port" || return 0
-        sleep 1
-        tries=$((tries + 1))
-    done
-    return 1
-}
-
-adb_wifi_configured() {
-    local port="${ADB_WIFI_PORT:-5555}"
-    if [ "$ADB_WIFI_ENABLE" = 1 ]; then
-        [ "$(getprop service.adb.tcp.port 2>/dev/null)" = "$port" ] || return 1
-        adb_port_listening "$port" || return 1
-        return 0
-    fi
-    [ -z "$(getprop service.adb.tcp.port 2>/dev/null)" ] || return 1
-    adb_port_listening "$port" && return 1
-    return 0
-}
-
 runtime_active_complete() {
     runtime_mounts_complete || return 1
     services_configured || return 1
-    adb_wifi_configured || return 1
     return 0
-}
-
-enable_adb_wifi() {
-    local port="${ADB_WIFI_PORT:-5555}"
-    command -v resetprop >/dev/null 2>&1 || {
-        log ERROR "未找到 resetprop 工具，无法开启无线调试"
-        return 1
-    }
-    resetprop service.adb.tcp.port "$port" 2>/dev/null || return 1
-    restart_adbd || return 1
-    [ "$(getprop service.adb.tcp.port)" = "$port" ] || {
-        log ERROR "无线调试端口设置验证失败"
-        return 1
-    }
-    wait_adb_port_listening "$port" || {
-        log ERROR "无线调试端口未监听：$port"
-        return 1
-    }
-    log INFO "已开启无线调试端口 $port"
-    return 0
-}
-
-disable_adb_wifi() {
-    local port="${ADB_WIFI_PORT:-5555}" old_port
-    old_port="$(getprop service.adb.tcp.port 2>/dev/null)"
-    command -v resetprop >/dev/null 2>&1 || {
-        log ERROR "未找到 resetprop 工具，无法关闭无线调试"
-        return 1
-    }
-    resetprop --delete service.adb.tcp.port 2>/dev/null || {
-        [ -z "$(getprop service.adb.tcp.port)" ] || return 1
-    }
-    restart_adbd || return 1
-    [ -z "$(getprop service.adb.tcp.port)" ] || {
-        log ERROR "无线调试端口清理验证失败"
-        return 1
-    }
-    wait_adb_port_closed "$port" || {
-        log ERROR "无线调试端口仍在监听：$port"
-        return 1
-    }
-    if [ -n "$old_port" ] && [ "$old_port" != "$port" ]; then
-        wait_adb_port_closed "$old_port" || {
-            log ERROR "无线调试旧端口仍在监听：$old_port"
-            return 1
-        }
-    fi
-    log INFO "已关闭无线调试"
-    return 0
-}
-
-apply_adb_wifi() {
-    if [ "${ADB_WIFI_DELAY_SEC:-0}" -gt 0 ]; then
-        log INFO "等待 ${ADB_WIFI_DELAY_SEC}s 后配置无线调试"
-        sleep "$ADB_WIFI_DELAY_SEC"
-    fi
-    if [ "$ADB_WIFI_ENABLE" = 1 ]; then
-        enable_adb_wifi
-    else
-        disable_adb_wifi
-    fi
 }
 
 apply_runtime() {
@@ -1212,20 +1258,18 @@ apply_runtime() {
     [ "$MASTER_ENABLE" = 1 ] || {
         log INFO "MASTER_ENABLE=0，不应用伪装"
         restore_runtime || result=1
-        disable_adb_wifi || result=1
         return "$result"
     }
     [ ! -e "$DISABLED_FILE" ] || {
         log INFO "检测到用户运行时禁用标记，不应用伪装"
         restore_runtime || result=1
-        disable_adb_wifi || result=1
         return "$result"
     }
     validate_config || return 1
     reconcile_runtime_state || return 1
     if [ -e "$ACTIVE_FILE" ] && runtime_active_complete; then
-        log INFO "当前运行时挂载、服务与无线调试状态均已生效，无需重复应用"
-        return 0
+        log INFO "检测到已有完整运行时挂载，按最新配置重新应用"
+        restore_runtime || return 1
     fi
     check_conflicts || return 1
     wait_for_thermal_zones || return 1
@@ -1257,16 +1301,12 @@ apply_runtime() {
     apply_private_services || {
         log WARN "厂商私有温控服务未完全按配置切换，已继续保留成功挂载"
     }
-    apply_adb_wifi || {
-        log WARN "无线调试未达到配置状态，已继续保留成功挂载"
-    }
 
     if ! date '+%Y-%m-%d %H:%M:%S' > "$ACTIVE_FILE.tmp.$$" || \
         ! mv -f "$ACTIVE_FILE.tmp.$$" "$ACTIVE_FILE"; then
         rm -f "$ACTIVE_FILE.tmp.$$"
         log ERROR "写入 active 状态失败，开始回滚"
         restore_runtime
-        disable_adb_wifi 2>/dev/null || true
         return 1
     fi
     log INFO "模块应用完成；本脚本为一次性执行，不驻留后台"
@@ -1274,28 +1314,65 @@ apply_runtime() {
 }
 
 restore_mounts() {
-    local target source result=0
+    local target source result=0 tracked_failed=0 residual_result=0
     RESTORE_MOUNTS_LAZY_USED=0
     if [ -f "$MOUNTS_FILE" ]; then
         while IFS="$TAB" read -r target source; do
             [ -n "$target" ] && [ -n "$source" ] || {
-                result=1
+                tracked_failed=1
                 continue
             }
             if ! unmount_exact "$target"; then
-                result=1
+                tracked_failed=1
             fi
         done < "$MOUNTS_FILE"
-        if [ "$result" -ne 0 ]; then
-            log ERROR "部分 bind mount 卸载失败，已保留完整追踪记录"
-            return 1
-        fi
-        rm -f "$MOUNTS_FILE"
+        [ "$tracked_failed" -ne 0 ] && log WARN "按追踪记录卸载不完整，继续扫描运行时残留"
     fi
+
+    restore_residual_mounts || residual_result=1
+    [ "$residual_result" -eq 0 ] || result=1
+
+    if runtime_tracked_mountpoints_present; then
+        log ERROR "兜底卸载后仍检测到 thermal/power_supply bind mount 残留"
+        result=1
+    fi
+
+    [ "$result" -eq 0 ] && rm -f "$MOUNTS_FILE"
+
     restore_fake_roots || {
         log ERROR "SELinux context tmpfs 卸载失败"
         return 1
     }
+    return "$result"
+}
+
+restore_residual_mounts() {
+    local list="$STATE_DIR/residual-mounts.$$" target count=0 failed=0
+    runtime_tracked_mountpoints > "$list" 2>/dev/null || {
+        rm -f "$list"
+        return 0
+    }
+    [ -s "$list" ] || {
+        rm -f "$list"
+        return 0
+    }
+
+    while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        count=$((count + 1))
+        log WARN "检测到运行时挂载残留，尝试兜底卸载：$target"
+        unmount_exact "$target" || {
+            failed=$((failed + 1))
+            log ERROR "兜底卸载失败：$target"
+        }
+    done < "$list"
+    rm -f "$list"
+
+    if [ "$failed" -gt 0 ]; then
+        log ERROR "兜底卸载未完成：total=$count failed=$failed"
+        return 1
+    fi
+    [ "$count" -gt 0 ] && log INFO "兜底卸载完成：total=$count"
     return 0
 }
 

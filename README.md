@@ -26,6 +26,12 @@ thermal zone、power_supply 节点、`/proc/shell-temp` 或厂商服务；运行
 只要至少一个 thermal zone 成功挂载，就不会因为其他入口失败而整体回滚。
 默认只伪装当前值位于 10°C～130°C 的 thermal zone 和 power_supply 温度节点，
 用于跳过 0、vbat 电压值、`-273000` 等明显不是正常温度读数的节点。
+`type=socd` 按 ColorOS 当前机型实测的摄氏度整数节点单独处理，其余 thermal zone
+仍按常见毫摄氏度节点处理。
+`sdr0`、`mmw_ific0` 等会随 5G/射频活动动态上线或深度休眠的节点归入
+`DYNAMIC_RADIO` 分类，默认关闭伪装，避免挂载数量随网络活动在两种状态间波动。
+除分类级配置外，`config.conf` 还支持按 thermal zone 的 `type` 写 `NODE_*`
+覆盖项；未配置的节点继续继承分类配置，因此模块不依赖配套 App 也可以单独使用。
 
 伪造文件通过 tmpfs 的 `context=` 挂载参数直接获得原温度节点使用的 SELinux 标签。
 当前白名单包括 `sysfs_therm`、`sysfs_thermal`、`sysfs_battery_supply`、
@@ -67,6 +73,7 @@ trip_point_0_temp=116500
 - 电池
 - 充电器
 - PMIC
+- dynamic radio，默认关闭
 - modem/RF
 - connectivity
 - NTC/ambient

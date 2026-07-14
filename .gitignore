@@ -11,3 +11,7 @@
 
 .idea
 
+.DS_Store
+
+# 本地发布包；正式版本在发布提交中使用 git add -f 纳入。
+/ColorOSFullTempSpoof-v*.zip
