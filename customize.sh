@@ -3,13 +3,14 @@
 ui_print "*******************************"
 ui_print " ColorOS Full Temperature Spoof "
 ui_print "*******************************"
-ui_print "面向 ColorOS 的动态温度读数伪装模块"
-ui_print "不限制机型、Android 版本或内核版本；发现什么节点就处理什么节点"
+ui_print "动态温度读数伪装 + PJZ110 Android 15 充电 DTBO 补丁"
+ui_print "温度伪装仍按实际节点动态处理；充电补丁严格限制 PJZ110/SDK 35"
 ui_print "运行时按 config.conf 分类伪装 thermal / power_supply 温度读数"
-ui_print "不修改 XML、thermal.conf、CPU 频率、cooling device 或 live sepolicy"
+ui_print "充电补丁仅移植 A16 PPS55，并提供独立的 PD/QC 27W 实验开关"
+ui_print "不改 SVOOC/UFCS、12V/PH2、满充电压、XML 或 cooling device"
 ui_print "不支持的节点、标签或服务会自动跳过，并记录到 module.log"
 ui_print "配置文件：config.conf；日志目录：/data/adb/coloros_fulltempspoof"
-ui_print "注意：本模块只改变用户空间读数，内核 critical 保护仍由系统负责"
+ui_print "安装过程不会刷写 DTBO；之后必须由 App 或 Magisk Action 明确触发"
 
 load_install_config() {
     POWER_SUPPLY_BATTERY_ENABLE=1
@@ -26,7 +27,32 @@ load_install_config() {
     VENDOR_THERMAL_HAL_SERVICE_MODE=keep
     VENDOR_THERMAL_HAL_AIDL_SERVICE_MODE=keep
     VENDOR_THERMAL_HAL_2_0_SERVICE_MODE=keep
+    CHARGING_DTBO_ENABLE=0
+    PPS55_ENABLE=1
+    PD_QC_27W_ENABLE=0
     [ -r "$MODPATH/config.conf" ] && . "$MODPATH/config.conf"
+}
+
+append_install_default() {
+    local key="$1" value="$2"
+    grep -q "^${key}=" "$MODPATH/config.conf" 2>/dev/null && return 0
+    [ ! -s "$MODPATH/config.conf" ] || printf '\n' >> "$MODPATH/config.conf" || return 1
+    printf '%s=%s\n' "$key" "$value" >> "$MODPATH/config.conf"
+}
+
+preserve_existing_config() {
+    local old_config="/data/adb/modules/ColorOSFullTempSpoof/config.conf"
+    [ -e "$old_config" ] || return 0
+    [ -r "$old_config" ] || return 1
+    if [ "$old_config" != "$MODPATH/config.conf" ]; then
+        cp -pf "$old_config" "$MODPATH/config.conf" || return 1
+    fi
+    # 旧版本没有充电键时只补安全默认值；已有显式选择保持不变。
+    append_install_default CHARGING_DTBO_ENABLE 0 || return 1
+    append_install_default PPS55_ENABLE 1 || return 1
+    append_install_default PD_QC_27W_ENABLE 0 || return 1
+    ui_print "- 已保留上一版本 config.conf（缺失的充电键使用安全默认值）"
+    return 0
 }
 
 install_context_supported() {
@@ -277,7 +303,28 @@ install_preflight() {
     fi
 }
 
+MODDIR="$MODPATH"
+. "$MODPATH/common.sh"
+if ! acquire_lock; then
+    ui_print "! 安装时无法获取全局运行锁；请等待 App、Action 或卸载操作结束后重试"
+    abort
+fi
+
+if ! preserve_existing_config; then
+    ui_print "! 保留上一版本 config.conf 失败，安装已中止"
+    abort
+fi
+
 install_preflight
+
+CHARGING_MODDIR="$MODPATH"
+. "$MODPATH/charging_dtbo.sh"
+chmod 0755 "$MODPATH/charging_dtbo.sh" "$MODPATH/avb_dtbo.sh" "$MODPATH/bin/fdtget" \
+    "$MODPATH/bin/fdtput" "$MODPATH/bin/mkdtimg" 2>/dev/null
+if ! charging_migrate_legacy_state "/data/adb/modules/ColorOSFullTempSpoof"; then
+    ui_print "! 旧版 DTBO 救援备份迁移失败，安装已中止；原文件与外置备份均未删除"
+    abort
+fi
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/service.sh" 0 0 0755
@@ -285,4 +332,18 @@ set_perm "$MODPATH/post-fs-data.sh" 0 0 0755
 set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 set_perm "$MODPATH/common.sh" 0 0 0755
+set_perm "$MODPATH/shell-bootstrap.sh" 0 0 0755
+set_perm "$MODPATH/charging_dtbo.sh" 0 0 0755
+set_perm "$MODPATH/avb_dtbo.sh" 0 0 0755
+set_perm "$MODPATH/bin/fdtget" 0 0 0755
+set_perm "$MODPATH/bin/fdtput" 0 0 0755
+set_perm "$MODPATH/bin/mkdtimg" 0 0 0755
 set_perm "$MODPATH/config.conf" 0 0 0644
+
+if ! release_lock; then
+    ui_print "! 安装收尾时释放全局运行锁失败"
+    abort
+fi
+
+ui_print "- 安装完成：未读取、修改或刷写 DTBO"
+ui_print "- 如需充电补丁，请重启后在 App 中保存并应用，或点击 Magisk Action"

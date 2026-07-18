@@ -1,0 +1,5 @@
+# relative-node property exact-final-hex-cells
+. oplus_spec,fccmax-ma-lv 0 2dc 44c 44c 44c 44c 44c 44c 0 0 12c 12c 12c 12c 12c 12c 12c 0 0 2dc 320 320 320 320 320 320 0 0 2dc 44c 44c 44c 44c 44c 44c 0 0 2dc 4c4 672 672 672 672 5d3 0 0 2dc 4c4 79f bb8 bb8 bb8 5d3 0 0 2dc 4c4 79f bb8 bb8 bb8 5d3 0
+. oplus_spec,fccmax-ma-hv 0 f4 1e8 44c 44c 44c 44c 44c 0 0 f4 12c 12c 12c 12c 12c 12c 0 0 f4 1e8 320 320 320 320 320 0 0 f4 1e8 44c 44c 44c 44c 44c 0 0 f4 1e8 4c4 4c4 672 672 5d3 0 0 f4 1e8 4c4 4c4 bb8 bb8 5d3 0 0 f4 1e8 4c4 4c4 bb8 bb8 5d3 0
+/silicon_p_770 oplus_spec,fccmax-ma-lv 0 fc 44c 44c 44c 44c 44c 44c 0 0 fc 12c 12c 12c 12c 12c 12c 0 0 fc 320 320 320 320 320 320 0 0 fc 44c 44c 44c 44c 44c 44c 0 0 fc 4ee 672 672 672 672 607 0 0 fc 4ee 7e4 bb8 bb8 bb8 607 0 0 fc 4ee 7e4 bb8 bb8 bb8 607 0
+/silicon_p_770 oplus_spec,fccmax-ma-hv 0 fc 1f9 2f5 44c 44c 44c 44c 0 0 fc 12c 12c 12c 12c 12c 12c 0 0 fc 1f9 2f5 320 320 320 320 0 0 fc 1f9 2f5 44c 44c 44c 44c 0 0 fc 1f9 2f5 4ee 672 672 607 0 0 fc 1f9 2f5 4ee bb8 bb8 607 0 0 fc 1f9 2f5 4ee bb8 bb8 607 0

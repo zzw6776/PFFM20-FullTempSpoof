@@ -1,0 +1,23 @@
+backup_created=2026-07-16 Asia/Shanghai
+device=PJZ110
+android_version=15
+sdk=35
+ota=PJZ110_11.A.77_0770_202508130220
+active_slot_at_backup=_a
+verified_boot_state=orange
+vbmeta_device_state=unlocked
+
+dtbo_a_partition=/dev/block/by-name/dtbo_a
+dtbo_a_resolved=/dev/block/sde16
+dtbo_a_size=25165824
+dtbo_a_sha256=d02115e11e519a0ad1d03fdf05f491baed409a9f7a05ff83cf4907b3d1d39ec5
+
+dtbo_b_partition=/dev/block/by-name/dtbo_b
+dtbo_b_resolved=/dev/block/sde52
+dtbo_b_size=25165824
+dtbo_b_sha256=95aeaae03b56c171cf88753c821630a3c24f1fcf406cec3e17d56781aa3f8369
+
+capture_method=root dd bs=4096 -> /data/local/tmp -> adb pull
+verification=remote SHA-256, local SHA-256 and exact byte size all matched
+
+warning=These images are only for the recorded PJZ110 Android 15 A.77 slot. Never swap slot A/B images and never use them for Android 16 C.91.

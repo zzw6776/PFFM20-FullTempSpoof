@@ -1,31 +1,14 @@
 #!/system/bin/sh
 
 MODDIR="${0%/*}"
+. "$MODDIR/shell-bootstrap.sh" || exit 1
 . "$MODDIR/common.sh"
 
 acquire_lock || {
     echo "已有实例正在执行，请稍后重试"
     exit 1
 }
-cleanup_lock() {
-    release_lock
-}
-
-handle_int() {
-    trap - EXIT INT TERM
-    release_lock
-    exit 130
-}
-
-handle_term() {
-    trap - EXIT INT TERM
-    release_lock
-    exit 143
-}
-
-trap 'cleanup_lock' EXIT
-trap 'handle_int' INT
-trap 'handle_term' TERM
+install_lock_signal_traps
 
 category_name_cn() {
     case "$1" in
@@ -52,6 +35,18 @@ validate_config || {
     echo "配置校验失败，请检查 config.conf"
     exit 1
 }
+
+CHARGING_MODDIR="$MODDIR"
+. "$MODDIR/charging_dtbo.sh"
+echo "========================================"
+echo "  充电 DTBO 配置"
+echo "========================================"
+if ! charging_apply_requested; then
+    echo "充电 DTBO 处理失败；温度配置未继续应用，请检查：$LOG_FILE"
+    exit 1
+fi
+[ "$CHARGING_REBOOT_REQUIRED" = 1 ] && echo "提示：DTBO 已变化，必须重启后充电配置才会生效"
+echo ""
 
 echo "========================================"
 echo "  ColorOS 温度传感器状态"

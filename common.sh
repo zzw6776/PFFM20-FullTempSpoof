@@ -2,14 +2,23 @@
 
 MODDIR="${MODDIR:-${0%/*}}"
 CONFIG_FILE="$MODDIR/config.conf"
-STATE_DIR="/data/adb/coloros_fulltempspoof"
+STATE_DIR="${PFFM_STATE_DIR:-/data/adb/coloros_fulltempspoof}"
 FAKE_ROOT="/dev/coloros_fulltempspoof"
 LOG_FILE="$STATE_DIR/module.log"
 MOUNTS_FILE="$STATE_DIR/mounts.tsv"
 MAP_FILE="$STATE_DIR/thermal-map.csv"
 ACTIVE_FILE="$STATE_DIR/active"
 DISABLED_FILE="$STATE_DIR/user_disabled"
-LOCK_DIR="$STATE_DIR/lock"
+LEGACY_LOCK_PATH="$STATE_DIR/lock"
+LEGACY_LOCK_OWNER_FILE="$STATE_DIR/lock.owner"
+LOCK_FILE="$STATE_DIR/lock.v2"
+LOCK_OWNER_FILE="$STATE_DIR/lock.v2.owner"
+PFFM_LOCK_HELD="${PFFM_LOCK_HELD:-0}"
+PFFM_LEGACY_FLOCK_HELD="${PFFM_LEGACY_FLOCK_HELD:-0}"
+PFFM_LEGACY_DIR_HELD="${PFFM_LEGACY_DIR_HELD:-0}"
+PFFM_LEGACY_DIR_START="${PFFM_LEGACY_DIR_START:-}"
+PFFM_LEGACY_DIR_TARGET="${PFFM_LEGACY_DIR_TARGET:-}"
+PFFM_LEGACY_LOCK_BOOT_CLEANUP="${PFFM_LEGACY_LOCK_BOOT_CLEANUP:-0}"
 ORIGINAL_RUNTIME_FILE="$STATE_DIR/original-runtime.conf"
 TAB="$(printf '\t')"
 
@@ -72,6 +81,10 @@ load_config() {
     CONFLICT_CHECK=1
     VERIFY_AFTER_APPLY=1
 
+    CHARGING_DTBO_ENABLE=0
+    PPS55_ENABLE=1
+    PD_QC_27W_ENABLE=0
+
     [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 }
 
@@ -100,7 +113,8 @@ validate_config() {
         BATTERY_ENABLE CHARGER_ENABLE PMIC_ENABLE DYNAMIC_RADIO_ENABLE MODEM_RF_ENABLE \
         CONNECTIVITY_ENABLE NTC_AMBIENT_ENABLE UNKNOWN_ENABLE \
         POWER_SUPPLY_BATTERY_ENABLE PROC_SHELL_TEMP_ENABLE \
-        THERMAL_VALUE_FILTER_ENABLE CONFLICT_CHECK VERIFY_AFTER_APPLY; do
+        THERMAL_VALUE_FILTER_ENABLE CONFLICT_CHECK VERIFY_AFTER_APPLY \
+        CHARGING_DTBO_ENABLE PPS55_ENABLE PD_QC_27W_ENABLE; do
         eval "value=\${$key}"
         is_bool "$value" || {
             log ERROR "配置错误：$key 必须为 0 或 1，当前为 $value"
@@ -1461,48 +1475,360 @@ process_start_time() {
     awk '{print $22}' "/proc/$1/stat" 2>/dev/null
 }
 
-write_lock_owner() {
-    local start_time
-    start_time="$(process_start_time "$$")"
-    [ -n "$start_time" ] || return 1
-    printf '%s\t%s\n' "$$" "$start_time" > "$LOCK_DIR/pid"
+pffm_find_busybox() {
+    local candidate magisk_path
+    if [ -n "${PFFM_BUSYBOX:-}" ] && [ -x "$PFFM_BUSYBOX" ]; then
+        printf '%s\n' "$PFFM_BUSYBOX"
+        return 0
+    fi
+    for candidate in \
+        /data/adb/magisk/busybox \
+        /debug_ramdisk/.magisk/busybox/busybox \
+        /data/adb/ksu/bin/busybox \
+        /data/adb/ap/bin/busybox; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    magisk_path="$(magisk --path 2>/dev/null | head -n 1)"
+    case "$magisk_path" in
+        /*)
+            for candidate in \
+                "$magisk_path/.magisk/busybox/busybox" \
+                "$magisk_path/busybox/busybox" \
+                "$magisk_path/busybox"; do
+                if [ -x "$candidate" ]; then
+                    printf '%s\n' "$candidate"
+                    return 0
+                fi
+            done
+            ;;
+    esac
+    candidate="$(command -v busybox 2>/dev/null)"
+    [ -n "$candidate" ] && [ -x "$candidate" ] || return 1
+    printf '%s\n' "$candidate"
 }
 
-lock_owner_alive() {
-    local owner_pid owner_start actual_start
-    IFS="$TAB" read -r owner_pid owner_start < "$LOCK_DIR/pid" 2>/dev/null || return 1
-    case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
+legacy_lock_owner_status() {
+    # 返回 0=仍存活，1=拥有者已明确退出，2=pid 尚未写入或内容不完整。
+    local dir="${1:-$LEGACY_LOCK_PATH}" owner_pid owner_start actual_start
+    [ -r "$dir/pid" ] || return 2
+    IFS="$TAB" read -r owner_pid owner_start < "$dir/pid" 2>/dev/null || return 2
+    case "$owner_pid" in ''|*[!0-9]*) return 2 ;; esac
     kill -0 "$owner_pid" 2>/dev/null || return 1
-    # 旧版锁只有 PID；无法排除 PID 复用时保守视为仍被持有。
+    # 只有 PID 的更老格式无法排除 PID 复用，保守视为仍被持有。
     [ -n "$owner_start" ] || return 0
     actual_start="$(process_start_time "$owner_pid")"
-    [ -n "$actual_start" ] && [ "$actual_start" = "$owner_start" ]
+    [ -n "$actual_start" ] && [ "$actual_start" = "$owner_start" ] && return 0
+    return 1
+}
+
+legacy_flock_owner_status() {
+    # 上一版 flock 即使锁文件被更老进程删除，独立 owner 文件仍可识别持锁者。
+    local owner_pid owner_start actual_start
+    [ -r "$LEGACY_LOCK_OWNER_FILE" ] || return 2
+    IFS="$TAB" read -r owner_pid owner_start < "$LEGACY_LOCK_OWNER_FILE" 2>/dev/null || return 2
+    case "$owner_pid" in ''|*[!0-9]*) return 2 ;; esac
+    kill -0 "$owner_pid" 2>/dev/null || return 1
+    [ -n "$owner_start" ] || return 0
+    actual_start="$(process_start_time "$owner_pid")"
+    [ -n "$actual_start" ] && [ "$actual_start" = "$owner_start" ] && return 0
+    return 1
+}
+
+check_legacy_flock_owner() {
+    local owner_status
+    [ -e "$LEGACY_LOCK_OWNER_FILE" ] || return 0
+    if legacy_flock_owner_status; then
+        log WARN "上一版 flock 仍由活动进程持有"
+        return 1
+    else
+        owner_status=$?
+    fi
+    if [ "$owner_status" = 1 ] || [ "$PFFM_LEGACY_LOCK_BOOT_CLEANUP" = 1 ]; then
+        rm -f "$LEGACY_LOCK_OWNER_FILE" 2>/dev/null || return 1
+        return 0
+    fi
+    log WARN "上一版 flock owner 状态不完整；本次拒绝执行并等待重启清理"
+    return 1
+}
+
+cleanup_legacy_dir_compat_link() {
+    local link_target target owner_status
+    [ -L "$LEGACY_LOCK_PATH" ] || return 0
+    link_target="$("$PFFM_BUSYBOX" readlink "$LEGACY_LOCK_PATH" 2>/dev/null)"
+    case "$link_target" in
+        .lock.v2-compat.*)
+            case "${link_target#.lock.v2-compat.}" in ''|*[!0-9]*) return 1 ;; esac
+            ;;
+        *) return 1 ;;
+    esac
+    target="$STATE_DIR/$link_target"
+    if [ ! -e "$target" ]; then
+        log WARN "清理目标目录已缺失的新版兼容屏障"
+        rm -f "$LEGACY_LOCK_PATH" 2>/dev/null || return 1
+        [ ! -e "$LEGACY_LOCK_PATH" ] && [ ! -L "$LEGACY_LOCK_PATH" ]
+        return $?
+    fi
+    [ -d "$target" ] && [ ! -L "$target" ] || return 1
+    if legacy_lock_owner_status "$LEGACY_LOCK_PATH"; then
+        log WARN "新版兼容目录屏障仍由活动进程持有"
+        return 1
+    else
+        owner_status=$?
+    fi
+    log WARN "清理拥有者已退出或状态损坏的新版兼容目录屏障（status=$owner_status）"
+    # rm -f 不会删除竞争者刚换入的真实目录；若路径已经被替换，安全失败。
+    rm -f "$LEGACY_LOCK_PATH" 2>/dev/null || return 1
+    rm -rf "$target" 2>/dev/null
+    [ ! -e "$LEGACY_LOCK_PATH" ] && [ ! -L "$LEGACY_LOCK_PATH" ]
+}
+
+migrate_legacy_lock_dir() {
+    local owner_status
+    if [ -L "$LEGACY_LOCK_PATH" ]; then
+        cleanup_legacy_dir_compat_link
+        return $?
+    fi
+    [ -d "$LEGACY_LOCK_PATH" ] || return 0
+    if legacy_lock_owner_status "$LEGACY_LOCK_PATH"; then
+        log WARN "旧版目录锁仍由活动进程持有"
+        return 1
+    else
+        owner_status=$?
+    fi
+    # 即使 pid 指向的进程已经退出，旧进程也可能刚好在状态判断后重新创建同一路径。
+    # 普通运行期绝不删除目录锁；只有 late_start 确认跨过重启边界后才允许清理。
+    if [ "$PFFM_LEGACY_LOCK_BOOT_CLEANUP" = 1 ]; then
+        log WARN "启动期清理已失效或状态不完整的旧版目录锁"
+        rm -f "$LEGACY_LOCK_PATH/pid" 2>/dev/null
+        rmdir "$LEGACY_LOCK_PATH" 2>/dev/null || return 1
+        return 0
+    fi
+    if [ "$owner_status" = 1 ]; then
+        log WARN "旧版目录锁拥有者已退出；为避免跨版本替换竞争，本次拒绝执行并等待重启清理"
+    else
+        log WARN "旧版目录锁状态不确定；为避免跨版本竞争，本次拒绝执行并等待重启清理"
+    fi
+    return 1
+}
+
+acquire_legacy_flock_compat() {
+    local busybox="$1"
+    PFFM_LEGACY_FLOCK_HELD=0
+    [ -e "$LEGACY_LOCK_PATH" ] || return 0
+    [ -f "$LEGACY_LOCK_PATH" ] && [ ! -L "$LEGACY_LOCK_PATH" ] || return 1
+    exec 8>"$LEGACY_LOCK_PATH" || return 1
+    "$busybox" flock -n 8 >/dev/null 2>&1 || {
+        exec 8>&-
+        return 1
+    }
+    PFFM_LEGACY_FLOCK_HELD=1
+    return 0
+}
+
+acquire_legacy_dir_compat() {
+    local target link_tmp link_name start_time owner_pid owner_start actual_link
+    PFFM_LEGACY_DIR_HELD=0
+    PFFM_LEGACY_DIR_START=
+    PFFM_LEGACY_DIR_TARGET=
+    target="$STATE_DIR/.lock.v2-compat.$$"
+    link_tmp="$STATE_DIR/.lock.v2-link.$$"
+    link_name="${target##*/}"
+    rm -rf "$target" "$link_tmp" 2>/dev/null
+    mkdir "$target" || return 1
+    chmod 0700 "$target" 2>/dev/null || {
+        rmdir "$target" 2>/dev/null
+        return 1
+    }
+    start_time="$(process_start_time "$$")"
+    [ -n "$start_time" ] || {
+        rmdir "$target" 2>/dev/null
+        return 1
+    }
+    printf '%s\t%s\n' "$$" "$start_time" > "$target/pid" || {
+        rm -rf "$target" 2>/dev/null
+        return 1
+    }
+    chmod 0600 "$target/pid" 2>/dev/null || {
+        rm -rf "$target" 2>/dev/null
+        return 1
+    }
+    "$PFFM_BUSYBOX" ln -s "$link_name" "$link_tmp" 2>/dev/null || {
+        rm -rf "$target" "$link_tmp" 2>/dev/null
+        return 1
+    }
+
+    # 上一版 flock 使用同一路径的普通文件。只有已经取得该 inode 的排他锁，
+    # 才允许移除路径并原子换成带完整 pid 的目录屏障。
+    if [ -e "$LEGACY_LOCK_PATH" ] || [ -L "$LEGACY_LOCK_PATH" ]; then
+        if [ "$PFFM_LEGACY_FLOCK_HELD" != 1 ] || \
+            [ ! -f "$LEGACY_LOCK_PATH" ] || [ -L "$LEGACY_LOCK_PATH" ]; then
+            rm -rf "$target" "$link_tmp" 2>/dev/null
+            return 1
+        fi
+        rm -f "$LEGACY_LOCK_PATH" 2>/dev/null || {
+            rm -rf "$target" "$link_tmp" 2>/dev/null
+            return 1
+        }
+    fi
+
+    # mv -nT 在旧版 mkdir 抢先成功时不会覆盖它；反之，指向完整 pid 目录的
+    # symlink 一次性出现在旧路径，旧版看不到“目录存在但 pid 尚未写入”的窗口。
+    "$PFFM_BUSYBOX" mv -nT "$link_tmp" "$LEGACY_LOCK_PATH" 2>/dev/null
+    actual_link="$("$PFFM_BUSYBOX" readlink "$LEGACY_LOCK_PATH" 2>/dev/null)"
+    if [ -e "$link_tmp" ] || [ ! -L "$LEGACY_LOCK_PATH" ] || \
+        [ "$actual_link" != "$link_name" ]; then
+        rm -rf "$target" "$link_tmp" 2>/dev/null
+        return 1
+    fi
+    IFS="$TAB" read -r owner_pid owner_start < "$target/pid" 2>/dev/null || return 1
+    if [ "$owner_pid" != "$$" ] || [ "$owner_start" != "$start_time" ]; then
+        return 1
+    fi
+    PFFM_LEGACY_DIR_HELD=1
+    PFFM_LEGACY_DIR_START="$start_time"
+    PFFM_LEGACY_DIR_TARGET="$target"
+    return 0
+}
+
+release_legacy_dir_compat() {
+    local owner_pid owner_start current_start actual_link
+    [ "$PFFM_LEGACY_DIR_HELD" = 1 ] || return 0
+    [ -n "$PFFM_LEGACY_DIR_TARGET" ] || return 1
+    IFS="$TAB" read -r owner_pid owner_start < "$PFFM_LEGACY_DIR_TARGET/pid" 2>/dev/null || return 1
+    current_start="$(process_start_time "$$")"
+    actual_link="$("$PFFM_BUSYBOX" readlink "$LEGACY_LOCK_PATH" 2>/dev/null)"
+    [ "$owner_pid" = "$$" ] && [ -n "$current_start" ] && \
+        [ "$owner_start" = "$current_start" ] && \
+        [ "$owner_start" = "$PFFM_LEGACY_DIR_START" ] && \
+        [ "$actual_link" = "${PFFM_LEGACY_DIR_TARGET##*/}" ] || return 1
+    # 先删除 symlink；rm -f 遇到竞争者换入的真实目录会失败且不会误删。
+    rm -f "$LEGACY_LOCK_PATH" 2>/dev/null || return 1
+    rm -f "$PFFM_LEGACY_DIR_TARGET/pid" 2>/dev/null || return 1
+    rmdir "$PFFM_LEGACY_DIR_TARGET" 2>/dev/null || return 1
+    PFFM_LEGACY_DIR_HELD=0
+    PFFM_LEGACY_DIR_START=
+    PFFM_LEGACY_DIR_TARGET=
+    return 0
+}
+
+release_legacy_flock_compat() {
+    [ "$PFFM_LEGACY_FLOCK_HELD" = 1 ] || return 0
+    "$PFFM_BUSYBOX" flock -u 8 >/dev/null 2>&1
+    exec 8>&-
+    PFFM_LEGACY_FLOCK_HELD=0
+    return 0
+}
+
+write_lock_owner() {
+    local start_time tmp
+    start_time="$(process_start_time "$$")"
+    [ -n "$start_time" ] || return 1
+    tmp="$LOCK_OWNER_FILE.tmp.$$"
+    printf '%s\t%s\n' "$$" "$start_time" > "$tmp" || {
+        rm -f "$tmp"
+        return 1
+    }
+    chmod 0600 "$tmp" 2>/dev/null || {
+        rm -f "$tmp"
+        return 1
+    }
+    mv -f "$tmp" "$LOCK_OWNER_FILE" || {
+        rm -f "$tmp"
+        return 1
+    }
+    return 0
 }
 
 acquire_lock() {
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-        write_lock_owner || {
-            rm -rf "$LOCK_DIR" 2>/dev/null
-            return 1
-        }
-        return 0
-    fi
-    lock_owner_alive && return 1
-    log WARN "清理已失效的陈旧锁"
-    rm -rf "$LOCK_DIR" 2>/dev/null
-    mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    local busybox
+    [ "$PFFM_LOCK_HELD" = 1 ] && return 0
+    busybox="$(pffm_find_busybox)" || {
+        log ERROR "缺少支持 flock 的 BusyBox，拒绝进入临界区"
+        return 1
+    }
+    PFFM_BUSYBOX="$busybox"
+    check_legacy_flock_owner || return 1
+    migrate_legacy_lock_dir || return 1
+    acquire_legacy_flock_compat "$busybox" || return 1
+    acquire_legacy_dir_compat || {
+        release_legacy_flock_compat
+        return 1
+    }
+
+    # Android mksh 会让 exec 9>file 打开的 FD 在外部命令执行时不可见。
+    # 所有入口必须先由 shell-bootstrap.sh 切到 BusyBox ash；若没有切换，
+    # flock 会失败并安全退出，而不是退回存在竞争窗口的目录锁。
+    exec 9>"$LOCK_FILE" || {
+        release_legacy_dir_compat
+        release_legacy_flock_compat
+        return 1
+    }
+    chmod 0600 "$LOCK_FILE" 2>/dev/null || {
+        exec 9>&-
+        release_legacy_dir_compat
+        release_legacy_flock_compat
+        return 1
+    }
+    "$PFFM_BUSYBOX" flock -n 9 >/dev/null 2>&1 || {
+        exec 9>&-
+        release_legacy_dir_compat
+        release_legacy_flock_compat
+        return 1
+    }
+    PFFM_LOCK_HELD=1
     write_lock_owner || {
-        rm -rf "$LOCK_DIR" 2>/dev/null
+        "$PFFM_BUSYBOX" flock -u 9 >/dev/null 2>&1
+        exec 9>&-
+        PFFM_LOCK_HELD=0
+        release_legacy_dir_compat
+        release_legacy_flock_compat
         return 1
     }
     return 0
 }
 
 release_lock() {
-    local owner_pid owner_start current_start
-    IFS="$TAB" read -r owner_pid owner_start < "$LOCK_DIR/pid" 2>/dev/null || return 0
-    [ "$owner_pid" = "$$" ] || return 0
-    current_start="$(process_start_time "$$")"
-    [ -n "$owner_start" ] && [ "$owner_start" = "$current_start" ] || return 0
-    rm -rf "$LOCK_DIR" 2>/dev/null
+    local result=0
+    [ "$PFFM_LOCK_HELD" = 1 ] || return 0
+    rm -f "$LOCK_OWNER_FILE" 2>/dev/null
+    # 先撤销旧路径屏障，最后才释放 lock.v2；这样旧进程无法删除下一位
+    # 新版持锁者刚建立的兼容屏障。
+    release_legacy_dir_compat || result=1
+    release_legacy_flock_compat || result=1
+    "$PFFM_BUSYBOX" flock -u 9 >/dev/null 2>&1 || result=1
+    exec 9>&-
+    PFFM_LOCK_HELD=0
+    return "$result"
+}
+
+cleanup_lock() {
+    release_lock
+}
+
+handle_lock_int() {
+    trap - EXIT HUP INT TERM
+    release_lock
+    exit 130
+}
+
+handle_lock_term() {
+    trap - EXIT HUP INT TERM
+    release_lock
+    exit 143
+}
+
+handle_lock_hup() {
+    trap - EXIT HUP INT TERM
+    release_lock
+    exit 129
+}
+
+install_lock_signal_traps() {
+    trap 'cleanup_lock' EXIT
+    trap 'handle_lock_hup' HUP
+    trap 'handle_lock_int' INT
+    trap 'handle_lock_term' TERM
 }

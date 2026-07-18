@@ -1,16 +1,19 @@
 #!/system/bin/sh
 
 MODDIR="${0%/*}"
+. "$MODDIR/shell-bootstrap.sh" || exit 1
 STATE_DIR="/data/adb/coloros_fulltempspoof"
 FAKE_ROOT="/dev/coloros_fulltempspoof"
 result=0
 used_common=0
+lock_acquired=0
 
 if [ -r "$MODDIR/common.sh" ]; then
     . "$MODDIR/common.sh"
     used_common=1
     if acquire_lock; then
-        trap 'release_lock' EXIT
+        lock_acquired=1
+        install_lock_signal_traps
         restore_runtime || result=1
     else
         log ERROR "卸载时无法获取运行锁，保留运行时状态供重试"
@@ -183,9 +186,51 @@ else
     restore_runtime_services_fallback || result=1
 fi
 
+# DTBO 是持久修改：逐槽位恢复所有仍由本模块持有的镜像；任何槽位无法确认时都保留救援目录。
+if [ "$lock_acquired" -ne 1 ]; then
+    if [ "$used_common" -eq 1 ]; then
+        log ERROR "卸载时未持有运行锁，跳过 DTBO 恢复并保留救援目录"
+    else
+        echo "卸载时无法建立可靠运行锁，跳过 DTBO 恢复并保留救援目录" >&2
+    fi
+    result=1
+elif [ -r "$MODDIR/charging_dtbo.sh" ]; then
+    CHARGING_MODDIR="$MODDIR"
+    . "$MODDIR/charging_dtbo.sh"
+    if charging_restore_all_owned; then
+        if charging_has_unresolved_rescue_artifacts; then
+            log ERROR "卸载后仍存在未解决的 DTBO 准备/回滚文件，保留整个救援目录"
+            result=1
+        fi
+    else
+        result=1
+    fi
+else
+    for rescue_file in "$MODDIR/original_dtbo.img" "$MODDIR/charging_state.conf" \
+        "$STATE_DIR/dtbo-rescue" "$STATE_DIR/dtbo-rescue"/*; do
+        [ -e "$rescue_file" ] || continue
+        [ "$used_common" -eq 1 ] && log ERROR "charging_dtbo.sh 缺失，无法安全恢复 DTBO"
+        result=1
+        break
+    done
+fi
+
 if [ "$result" -eq 0 ]; then
     rm -rf "$FAKE_ROOT" 2>/dev/null
-    rm -rf "$STATE_DIR" 2>/dev/null
+    # flock 锁住的是 inode，持锁时删除 lock.v2 或兼容期旧 lock 文件会允许
+    # 其他进程在同一路径创建新 inode。因此保留锁文件，只清理其余模块状态；
+    # EXIT trap 最后关闭 FD，由内核释放锁。
+    for state_item in "$STATE_DIR"/*; do
+        [ -e "$state_item" ] || continue
+        case "$state_item" in
+            "$LOCK_FILE"|"$LOCK_OWNER_FILE"|"$LEGACY_LOCK_PATH"|"$LEGACY_LOCK_OWNER_FILE"|\
+            "$PFFM_LEGACY_DIR_TARGET") continue ;;
+        esac
+        rm -rf "$state_item" 2>/dev/null || result=1
+    done
+fi
+
+if [ "$result" -eq 0 ]; then
     exit 0
 fi
 

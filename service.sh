@@ -1,31 +1,16 @@
 #!/system/bin/sh
 
 MODDIR="${0%/*}"
+PFFM_LEGACY_LOCK_BOOT_CLEANUP=1
+export PFFM_LEGACY_LOCK_BOOT_CLEANUP
+. "$MODDIR/shell-bootstrap.sh" || exit 1
 . "$MODDIR/common.sh"
 
 acquire_lock || {
     log WARN "已有实例正在执行，本次退出"
     exit 0
 }
-cleanup_lock() {
-    release_lock
-}
-
-handle_int() {
-    trap - EXIT INT TERM
-    release_lock
-    exit 130
-}
-
-handle_term() {
-    trap - EXIT INT TERM
-    release_lock
-    exit 143
-}
-
-trap 'cleanup_lock' EXIT
-trap 'handle_int' INT
-trap 'handle_term' TERM
+install_lock_signal_traps
 
 log INFO "========== service start =========="
 
