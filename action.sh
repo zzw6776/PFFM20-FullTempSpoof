@@ -88,17 +88,13 @@ for zone in /sys/class/thermal/thermal_zone*; do
     temp_raw="$(cat "$zone/temp" 2>/dev/null | tr -d ' \r\n')"
     [ -n "$type" ] || type="unknown"
     [ -n "$temp_raw" ] || temp_raw="-"
+    thermal_type_is_non_temperature "$type" && continue
 
     category="$(classify_zone "$type")"
     cat_cn="$(category_name_cn "$category")"
 
-    # 真实温度：常规 thermal zone 为毫摄氏度；socd 使用摄氏度整数。
     if [ "$temp_raw" != "-" ] && [ "$temp_raw" != "0" ] 2>/dev/null; then
-        if thermal_type_uses_celsius_unit "$type"; then
-            real_c="$(awk "BEGIN { printf \"%.1f\", $temp_raw }")"
-        else
-            real_c="$(awk "BEGIN { printf \"%.1f\", $temp_raw / 1000 }")"
-        fi
+        real_c="$(awk "BEGIN { printf \"%.1f\", $temp_raw / 1000 }")"
     else
         real_c="$temp_raw"
     fi

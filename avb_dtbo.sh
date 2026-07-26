@@ -414,6 +414,7 @@ avb_verify_dtbo_image() {
     local source="$1"
     local raw="$2"
     local candidate="$3"
+    local raw_prevalidated="${4:-0}"
     local source_image_size source_footer_offset source_version_major source_version_minor
     local source_vbmeta_offset source_vbmeta_size source_page_size
     local raw_size raw_page_size expected_vbmeta_offset
@@ -430,9 +431,15 @@ avb_verify_dtbo_image() {
     source_vbmeta_size="$AVB_VBMETA_SIZE"
     source_page_size="$AVB_DT_PAGE_SIZE"
 
-    avb_validate_raw_dtbo "$raw" || return 1
-    raw_size="$AVB_RAW_SIZE"
-    raw_page_size="$AVB_RAW_PAGE_SIZE"
+    if [ "$raw_prevalidated" = 1 ]; then
+        raw_size="$(avb_file_size "$raw")" || return 1
+        raw_page_size="$(avb_read_be32 "$raw" 24)" || return 1
+    else
+        [ "$raw_prevalidated" = 0 ] || return 1
+        avb_validate_raw_dtbo "$raw" || return 1
+        raw_size="$AVB_RAW_SIZE"
+        raw_page_size="$AVB_RAW_PAGE_SIZE"
+    fi
     [ "$raw_page_size" -eq "$source_page_size" ] || {
         avb_fail "重打包 page_size($raw_page_size) 与原始值($source_page_size) 不一致"
         return 1
@@ -578,7 +585,9 @@ avb_build_dtbo_image() {
     }
     rm -f "$footer"
 
-    avb_verify_dtbo_image "$source" "$raw" "$output" || {
+    # raw 已在构建前完整校验且期间只读；这里复核新候选与 raw/原 vbmeta/footer
+    # 的关系，不再对同一 raw 立即重复完整结构校验。
+    avb_verify_dtbo_image "$source" "$raw" "$output" 1 || {
         rm -f "$output"
         return 1
     }

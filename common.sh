@@ -192,6 +192,17 @@ node_config_temp_c() {
     return 1
 }
 
+thermal_type_is_non_temperature() {
+    local type
+    type="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    case "$type" in
+        socd|vbat|pm8550-bcl-lvl[0-2]|pmih010x-bcl-lvl[0-2]|pmih010x-ibat-lvl[01])
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 module_is_active() {
     local dir="$1"
     [ -d "$dir" ] && [ ! -e "$dir/disable" ] && [ ! -e "$dir/remove" ]
@@ -337,33 +348,12 @@ thermal_value_valid() {
         [ "$value" -le "$THERMAL_VALID_MAX_MILLI_C" ]
 }
 
-thermal_type_uses_celsius_unit() {
-    local type
-    type="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
-    [ "$type" = socd ]
-}
-
 thermal_value_valid_for_type() {
-    local type="$1" value="$2" min max
-    if ! thermal_type_uses_celsius_unit "$type"; then
-        thermal_value_valid "$value"
-        return $?
-    fi
-
-    [ "${THERMAL_VALUE_FILTER_ENABLE:-1}" = 1 ] || return 0
-    signed_int "$value" || return 1
-    min="$(valid_min_c)"
-    max="$(valid_max_c)"
-    [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]
+    thermal_value_valid "$2"
 }
 
 thermal_fake_value_for_type() {
-    local type="$1" temp_c="$2"
-    if thermal_type_uses_celsius_unit "$type"; then
-        printf '%s\n' "$temp_c"
-        return 0
-    fi
-    printf '%s\n' $((temp_c * 1000))
+    printf '%s\n' $(($2 * 1000))
 }
 
 valid_min_c() {
@@ -495,6 +485,7 @@ expected_runtime_targets() {
         raw="$(cat "$zone/temp" 2>/dev/null | tr -d ' \r\n')"
         type="$(cat "$zone/type" 2>/dev/null | tr -d '\r\n')"
         [ -n "$type" ] || type=unknown
+        thermal_type_is_non_temperature "$type" && continue
         thermal_value_valid_for_type "$type" "$raw" || continue
         category="$(classify_zone "$type")"
         thermal_target_enabled_for_type "$type" "$category" || continue
@@ -718,7 +709,7 @@ map_write_csv_row() {
 }
 
 apply_thermal_zones() {
-    local zone name type category temp_c fake_value before mode result mounted=0 skipped=0 failed=0 invalid=0
+    local zone name type category temp_c fake_value before mode result mounted=0 skipped=0 failed=0 invalid=0 excluded=0
     local skipped_map="$STATE_DIR/thermal-map.skipped.$$"
     local failed_map="$STATE_DIR/thermal-map.failed.$$"
     local mounted_map="$STATE_DIR/thermal-map.mounted.$$"
@@ -743,6 +734,10 @@ apply_thermal_zones() {
         [ -n "$type" ] || type=unknown
         [ -n "$before" ] || before=-
         [ -n "$mode" ] || mode=-
+        if thermal_type_is_non_temperature "$type"; then
+            excluded=$((excluded + 1))
+            continue
+        fi
         category="$(classify_zone "$type")"
 
         if ! thermal_value_valid_for_type "$type" "$before"; then
@@ -783,7 +778,7 @@ apply_thermal_zones() {
     }
     rm -f "$skipped_map" "$failed_map" "$mounted_map"
 
-    log INFO "thermal zone 应用完成：mounted=$mounted skipped=$skipped invalid=$invalid failed=$failed"
+    log INFO "thermal zone 应用完成：mounted=$mounted skipped=$skipped invalid=$invalid excluded_non_temperature=$excluded failed=$failed"
     if [ "$mounted" -gt 0 ]; then
         [ "$failed" -eq 0 ] || log WARN "部分 thermal zone 未能伪装，已继续保留成功挂载的节点"
         return 0

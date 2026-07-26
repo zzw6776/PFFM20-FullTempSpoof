@@ -1,6 +1,6 @@
 id=ColorOSFullTempSpoof
 name=ColorOS Full Temperature Spoof
-version=1.1.10
-versionCode=10110
+version=1.1.21
+versionCode=10121
 author=MRLL
 description=ColorOS动态温度读数伪装；PJZ110 Android 15专用PPS55与PD/QC 27W实验开关；AVB-aware DTBO仅允许Bootconfig明确解锁，两阶段提交并外置保存救援备份。

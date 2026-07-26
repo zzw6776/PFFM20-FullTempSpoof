@@ -11,9 +11,17 @@ CHARGING_AVB_HELPER="${CHARGING_AVB_HELPER:-$CHARGING_MODDIR/avb_dtbo.sh}"
 CHARGING_PPS_CELLS="${CHARGING_PPS_CELLS:-$CHARGING_MODDIR/charging/pps55.cells}"
 CHARGING_PD_QC_FCC_CELLS="${CHARGING_PD_QC_FCC_CELLS:-$CHARGING_MODDIR/charging/pdqc27-fcc.cells}"
 CHARGING_RESCUE_DIR="${CHARGING_RESCUE_DIR:-/data/adb/coloros_fulltempspoof/dtbo-rescue}"
+# 这两个哈希来自项目内 rescue/PJZ110-A77 的实机只读备份。独立“原始备份”
+# 只接受已知原厂镜像；不能仅凭“当前没有模块状态”就把任意 DTBO 定义成原始。
+CHARGING_TRUSTED_ORIGINAL_A_SHA256="${CHARGING_TRUSTED_ORIGINAL_A_SHA256:-d02115e11e519a0ad1d03fdf05f491baed409a9f7a05ff83cf4907b3d1d39ec5}"
+CHARGING_TRUSTED_ORIGINAL_B_SHA256="${CHARGING_TRUSTED_ORIGINAL_B_SHA256:-95aeaae03b56c171cf88753c821630a3c24f1fcf406cec3e17d56781aa3f8369}"
+CHARGING_TRUSTED_ORIGINAL_SIZE="${CHARGING_TRUSTED_ORIGINAL_SIZE:-25165824}"
 CHARGING_BATTERY_UNLOCKER_MODULE_DIR="${CHARGING_BATTERY_UNLOCKER_MODULE_DIR:-/data/adb/modules/battery_unlocker}"
 CHARGING_BATTERY_UNLOCKER_UPDATE_DIR="${CHARGING_BATTERY_UNLOCKER_UPDATE_DIR:-/data/adb/modules_update/battery_unlocker}"
 CHARGING_BATTERY_UNLOCKER_RESCUE_ROOT="${CHARGING_BATTERY_UNLOCKER_RESCUE_ROOT:-/data/adb/op13_battery_unlocker/dtbo-rescue}"
+CHARGING_API_VERSION=3
+CHARGING_CANDIDATE_VERIFICATION_SCHEME=semantic-v3
+CHARGING_PREPARE_OUTCOME=
 CHARGING_SELECTED_SLOT=
 CHARGING_BACKUP=
 CHARGING_STATE_FILE=
@@ -22,6 +30,7 @@ CHARGING_STATE_PENDING=
 CHARGING_BACKUP_PREVIOUS=
 CHARGING_STATE_PREVIOUS=
 CHARGING_OPERATION_FILE=
+CHARGING_RESTORE_PLAN="$CHARGING_RESCUE_DIR/restore_plan.conf"
 CHARGING_PREPARED_DIR=
 CHARGING_PREPARED_STATE=
 CHARGING_PREPARED_BASE=
@@ -39,6 +48,7 @@ CHARGING_PARTITION_CRITICAL=0
 CHARGING_AVB_HELPER_LOADED=0
 CHARGING_STATE_FORMAT=
 CHARGING_STATE_VALID=0
+CHARGING_STATE_BASELINE_ONLY=0
 CHARGING_STATE_PREVIOUS_PATCHED_HASH=
 CHARGING_STATE_PREVIOUS_PPS55=0
 CHARGING_STATE_PREVIOUS_PD_QC_27W=0
@@ -48,6 +58,23 @@ CHARGING_PREPARED_PRESENT=0
 CHARGING_PREPARED_SAFE=0
 CHARGING_PREPARED_PROBLEM=0
 CHARGING_PREPARED_PROBLEM_DETAIL=
+CHARGING_CANDIDATE_INTEGRITY_VALID=0
+CHARGING_CANDIDATE_CONTEXT_VALID=0
+CHARGING_CANDIDATE_LIVE_MATCH=0
+CHARGING_CANDIDATE_READY=0
+CHARGING_CANDIDATE_RELATION=unavailable
+CHARGING_CANDIDATE_ISSUE_KIND=
+CHARGING_PREPARED_CONFIG_HASH=
+CHARGING_PREPARED_RECIPE_HASH=
+CHARGING_PREPARED_FINGERPRINT_HASH=
+CHARGING_PREPARED_GENERATED_AT=
+CHARGING_PREPARED_VERIFICATION=
+CHARGING_PREPARED_VERIFIED_HASH=
+CHARGING_PREPARED_VERIFIED_AT=
+CHARGING_BACKUP_SLOT_RESULT=
+CHARGING_BACKUP_CREATED_SLOTS=
+CHARGING_BACKUP_VERIFIED_SLOTS=
+CHARGING_BACKUP_FAILED_SLOTS=
 
 if [ -r "$CHARGING_AVB_HELPER" ] && . "$CHARGING_AVB_HELPER"; then
     CHARGING_AVB_HELPER_LOADED=1
@@ -137,6 +164,46 @@ charging_sha256() {
     else
         return 1
     fi
+}
+
+charging_stream_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 2>/dev/null | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+charging_config_hash() {
+    [ -r "${CONFIG_FILE:-}" ] || return 1
+    charging_sha256 "$CONFIG_FILE"
+}
+
+charging_system_fingerprint_hash() {
+    local fingerprint
+    fingerprint="$(getprop ro.build.fingerprint 2>/dev/null)"
+    [ -n "$fingerprint" ] || return 1
+    printf '%s' "$fingerprint" | charging_stream_sha256
+}
+
+charging_recipe_hash() {
+    local path hash combined=
+    for path in \
+        "$CHARGING_MODDIR/charging_dtbo.sh" \
+        "$CHARGING_AVB_HELPER" \
+        "$CHARGING_PPS_CELLS" \
+        "$CHARGING_PD_QC_FCC_CELLS" \
+        "$CHARGING_FDTGET" \
+        "$CHARGING_FDTPUT" \
+        "$CHARGING_MKDTIMG"; do
+        [ -r "$path" ] || return 1
+        hash="$(charging_sha256 "$path")" || return 1
+        charging_is_sha256_value "$hash" || return 1
+        combined="${combined}${hash}"
+    done
+    printf '%s' "$combined" | charging_stream_sha256
 }
 
 charging_file_size() {
@@ -382,7 +449,7 @@ charging_require_tools() {
     [ -r "$CHARGING_PPS_CELLS" ] || charging_fail "PPS55 参数表不存在：$CHARGING_PPS_CELLS" || return 1
     [ -r "$CHARGING_PD_QC_FCC_CELLS" ] || charging_fail "PD/QC FCC 参数表不存在：$CHARGING_PD_QC_FCC_CELLS" || return 1
     [ "$CHARGING_AVB_HELPER_LOADED" = 1 ] || charging_fail "AVB-aware DTBO 助手加载失败：$CHARGING_AVB_HELPER" || return 1
-    for tool in od stat sha256sum cmp truncate dd awk; do
+    for tool in od stat sha256sum cmp truncate dd awk sort; do
         command -v "$tool" >/dev/null 2>&1 || {
             charging_fail "系统缺少 AVB/DTBO 容器校验命令：$tool"
             return 1
@@ -485,6 +552,67 @@ charging_preflight_apply() {
     return 0
 }
 
+charging_trusted_original_hash() {
+    case "$1" in
+        _a) printf '%s\n' "$CHARGING_TRUSTED_ORIGINAL_A_SHA256" ;;
+        _b) printf '%s\n' "$CHARGING_TRUSTED_ORIGINAL_B_SHA256" ;;
+        *) return 1 ;;
+    esac
+}
+
+charging_trusted_original_size() {
+    case "$1" in
+        _a|_b) printf '%s\n' "$CHARGING_TRUSTED_ORIGINAL_SIZE" ;;
+        *) return 1 ;;
+    esac
+}
+
+charging_image_has_avb_footer() {
+    local image="${1:-}" image_size footer_offset footer_magic
+    [ -f "$image" ] || return 1
+    image_size="$(charging_file_size "$image" 2>/dev/null)" || return 1
+    case "$image_size" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$image_size" -ge 64 ] || return 1
+    footer_offset=$((image_size - 64))
+    footer_magic="$(charging_read_hex "$image" "$footer_offset" 4 2>/dev/null)" || return 1
+    [ "$footer_magic" = "41564266" ]
+}
+
+charging_require_backup_tools() {
+    local tool
+    [ "$CHARGING_AVB_HELPER_LOADED" = 1 ] || {
+        charging_fail "AVB-aware DTBO 助手加载失败：$CHARGING_AVB_HELPER"
+        return 1
+    }
+    for tool in od stat sha256sum dd awk tr wc sync; do
+        command -v "$tool" >/dev/null 2>&1 || {
+            charging_fail "系统缺少原始 DTBO 备份校验命令：$tool"
+            return 1
+        }
+    done
+    return 0
+}
+
+charging_preflight_backup() {
+    local sdk slot
+    [ "${PFFM_LOCK_HELD:-0}" = 1 ] || {
+        charging_fail "未持有全局运行锁，拒绝建立原始 DTBO 备份"
+        return 1
+    }
+    charging_require_backup_tools || return 1
+    sdk="$(getprop ro.build.version.sdk 2>/dev/null)"
+    [ "$sdk" = 35 ] || {
+        charging_fail "原始 DTBO 自动识别仅支持 PJZ110 Android 15（SDK 35）；当前 SDK=${sdk:-unknown}"
+        return 1
+    }
+    slot="$(charging_active_slot)" || {
+        charging_fail "无法识别当前 A/B 活动槽位"
+        return 1
+    }
+    case "$slot" in _a|_b) ;; *) return 1 ;; esac
+    return 0
+}
+
 charging_state_field() {
     local key="$1" file="${2:-$CHARGING_STATE_FILE}"
     sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -n 1
@@ -494,10 +622,11 @@ charging_state_load_pair() {
     local file="${1:-$CHARGING_STATE_FILE}" backup="${2:-$CHARGING_BACKUP}"
     local format actual_hash actual_size combined_hashes
     CHARGING_STATE_VALID=0
+    CHARGING_STATE_BASELINE_ONLY=0
     [ -r "$file" ] && [ -r "$backup" ] || return 1
 
     format="$(charging_state_field format "$file")"
-    case "$format" in 1|2) ;; *) return 1 ;; esac
+    case "$format" in 1|2|3) ;; *) return 1 ;; esac
 
     CHARGING_STATE_FORMAT="$format"
     CHARGING_STATE_SLOT="$(charging_state_field slot "$file")"
@@ -509,16 +638,29 @@ charging_state_load_pair() {
     CHARGING_STATE_PREVIOUS_PATCHED_HASH=
     CHARGING_STATE_PREVIOUS_PPS55=0
     CHARGING_STATE_PREVIOUS_PD_QC_27W=0
-    if [ "$format" = 2 ]; then
+    if [ "$format" = 2 ] || [ "$format" = 3 ]; then
         CHARGING_STATE_PREVIOUS_PATCHED_HASH="$(charging_state_field previous_patched_sha256 "$file")"
         CHARGING_STATE_PREVIOUS_PPS55="$(charging_state_field previous_pps55 "$file")"
         CHARGING_STATE_PREVIOUS_PD_QC_27W="$(charging_state_field previous_pd_qc_27w "$file")"
     fi
+    if [ "$format" = 3 ]; then
+        CHARGING_STATE_BASELINE_ONLY="$(charging_state_field baseline_only "$file")"
+        charging_is_bool "$CHARGING_STATE_BASELINE_ONLY" || return 1
+    fi
 
     case "$CHARGING_STATE_SLOT" in _a|_b) ;; *) return 1 ;; esac
     [ "${#CHARGING_STATE_ORIGINAL_HASH}" -eq 64 ] || return 1
-    [ "${#CHARGING_STATE_PATCHED_HASH}" -eq 64 ] || return 1
-    combined_hashes="$CHARGING_STATE_ORIGINAL_HASH$CHARGING_STATE_PATCHED_HASH"
+    combined_hashes="$CHARGING_STATE_ORIGINAL_HASH"
+    if [ "$CHARGING_STATE_BASELINE_ONLY" = 1 ]; then
+        [ -z "$CHARGING_STATE_PATCHED_HASH" ] || return 1
+        [ -z "$CHARGING_STATE_PREVIOUS_PATCHED_HASH" ] || return 1
+        [ "$CHARGING_STATE_PPS55" = 0 ] && [ "$CHARGING_STATE_PD_QC_27W" = 0 ] || return 1
+        [ "$CHARGING_STATE_PREVIOUS_PPS55" = 0 ] && \
+            [ "$CHARGING_STATE_PREVIOUS_PD_QC_27W" = 0 ] || return 1
+    else
+        [ "${#CHARGING_STATE_PATCHED_HASH}" -eq 64 ] || return 1
+        combined_hashes="$combined_hashes$CHARGING_STATE_PATCHED_HASH"
+    fi
     if [ -n "$CHARGING_STATE_PREVIOUS_PATCHED_HASH" ]; then
         [ "${#CHARGING_STATE_PREVIOUS_PATCHED_HASH}" -eq 64 ] || return 1
         combined_hashes="$combined_hashes$CHARGING_STATE_PREVIOUS_PATCHED_HASH"
@@ -541,14 +683,16 @@ charging_state_load_pair() {
 charging_state_hash_owned() {
     local hash="$1"
     [ "$hash" = "$CHARGING_STATE_ORIGINAL_HASH" ] || \
-        [ "$hash" = "$CHARGING_STATE_PATCHED_HASH" ] || \
+        { [ -n "$CHARGING_STATE_PATCHED_HASH" ] && \
+            [ "$hash" = "$CHARGING_STATE_PATCHED_HASH" ]; } || \
         { [ -n "$CHARGING_STATE_PREVIOUS_PATCHED_HASH" ] && \
             [ "$hash" = "$CHARGING_STATE_PREVIOUS_PATCHED_HASH" ]; }
 }
 
 charging_state_patch_config_for_hash() {
     local hash="$1"
-    if [ "$hash" = "$CHARGING_STATE_PATCHED_HASH" ]; then
+    if [ -n "$CHARGING_STATE_PATCHED_HASH" ] && \
+        [ "$hash" = "$CHARGING_STATE_PATCHED_HASH" ]; then
         CHARGING_MATCHED_PPS55="$CHARGING_STATE_PPS55"
         CHARGING_MATCHED_PD_QC_27W="$CHARGING_STATE_PD_QC_27W"
         return 0
@@ -651,6 +795,10 @@ charging_state_write_file() {
     local file="$1" slot="$2" original_hash="$3" patched_hash="$4" image_size="$5"
     local pps55="${6:-${PPS55_ENABLE:-0}}" pd_qc_27w="${7:-${PD_QC_27W_ENABLE:-0}}"
     local previous_hash="${8:-}" previous_pps55="${9:-0}" previous_pd_qc_27w="${10:-0}" tmp
+    case "$slot" in _a|_b) ;; *) return 1 ;; esac
+    charging_is_sha256_value "$original_hash" || return 1
+    charging_is_sha256_value "$patched_hash" || return 1
+    case "$image_size" in ''|*[!0-9]*) return 1 ;; esac
     charging_is_bool "$pps55" && charging_is_bool "$pd_qc_27w" || return 1
     charging_is_bool "$previous_pps55" && charging_is_bool "$previous_pd_qc_27w" || return 1
     if [ -n "$previous_hash" ]; then
@@ -686,6 +834,77 @@ charging_state_write_file() {
         rm -f "$tmp"
         return 1
     }
+    return 0
+}
+
+charging_state_write_baseline_file() {
+    local file="$1" slot="$2" original_hash="$3" image_size="$4" tmp
+    case "$slot" in _a|_b) ;; *) return 1 ;; esac
+    charging_is_sha256_value "$original_hash" || return 1
+    case "$image_size" in ''|*[!0-9]*) return 1 ;; esac
+    tmp="$file.tmp.$$"
+    {
+        printf 'format=3\n'
+        printf 'slot=%s\n' "$slot"
+        printf 'baseline_only=1\n'
+        printf 'original_sha256=%s\n' "$original_hash"
+        printf 'patched_sha256=\n'
+        printf 'previous_patched_sha256=\n'
+        printf 'image_size=%s\n' "$image_size"
+        printf 'pps55=0\n'
+        printf 'pd_qc_27w=0\n'
+        printf 'previous_pps55=0\n'
+        printf 'previous_pd_qc_27w=0\n'
+    } > "$tmp" || {
+        rm -f "$tmp"
+        return 1
+    }
+    chmod 0600 "$tmp" 2>/dev/null || {
+        rm -f "$tmp"
+        return 1
+    }
+    mv -f "$tmp" "$file" || {
+        rm -f "$tmp"
+        return 1
+    }
+    return 0
+}
+
+charging_commit_original_backup() {
+    local source="$1" slot="$2" original_hash="$3" image_size="$4"
+    [ "${PFFM_LOCK_HELD:-0}" = 1 ] || {
+        charging_fail "未持有全局运行锁，拒绝提交原始 DTBO 备份"
+        return 1
+    }
+    charging_select_slot_state "$slot" || return 1
+    charging_ensure_rescue_dir || return 1
+    charging_slot_has_state_artifacts && {
+        charging_fail "槽位 $slot 已存在 DTBO 所有权文件；拒绝覆盖"
+        return 1
+    }
+
+    cp -f "$source" "$CHARGING_BACKUP_PENDING" || return 1
+    chmod 0600 "$CHARGING_BACKUP_PENDING" 2>/dev/null || return 1
+    charging_state_write_baseline_file "$CHARGING_STATE_PENDING" "$slot" \
+        "$original_hash" "$image_size" || return 1
+    charging_state_load_pair "$CHARGING_STATE_PENDING" "$CHARGING_BACKUP_PENDING" || {
+        charging_fail "槽位 $slot 的待提交原始 DTBO 备份校验失败"
+        return 1
+    }
+    # 先把完整 pending 对持久化，再依次切换正式备份和状态；任一步中断均可由
+    # charging_recover_state_transaction 使用 pending 文件前滚。
+    sync || return 1
+    mv -f "$CHARGING_BACKUP_PENDING" "$CHARGING_BACKUP" || return 1
+    if ! mv -f "$CHARGING_STATE_PENDING" "$CHARGING_STATE_FILE"; then
+        charging_recover_state_transaction || return 1
+    fi
+    charging_state_load_pair "$CHARGING_STATE_FILE" "$CHARGING_BACKUP" || {
+        charging_recover_state_transaction || return 1
+    }
+    chmod 0600 "$CHARGING_BACKUP" "$CHARGING_STATE_FILE" 2>/dev/null || return 1
+    sync || return 1
+    charging_state_load_pair "$CHARGING_STATE_FILE" "$CHARGING_BACKUP" || return 1
+    charging_cleanup_state_transaction
     return 0
 }
 
@@ -739,7 +958,7 @@ charging_commit_state_transaction() {
 
 charging_migrate_legacy_state() {
     local source_dir="$1" source_backup source_state
-    local slot original_hash patched_hash image_size pps55 pd_qc_27w
+    local slot original_hash patched_hash image_size pps55 pd_qc_27w baseline_only
 
     [ "${PFFM_LOCK_HELD:-0}" = 1 ] || {
         charging_fail "未持有全局运行锁，拒绝迁移旧版 DTBO 救援状态"
@@ -758,6 +977,7 @@ charging_migrate_legacy_state() {
     image_size="$CHARGING_STATE_IMAGE_SIZE"
     pps55="$CHARGING_STATE_PPS55"
     pd_qc_27w="$CHARGING_STATE_PD_QC_27W"
+    baseline_only="$CHARGING_STATE_BASELINE_ONLY"
     charging_select_slot_state "$slot" || return 1
     charging_ensure_rescue_dir || return 1
 
@@ -773,8 +993,13 @@ charging_migrate_legacy_state() {
     rm -f "$CHARGING_BACKUP_PENDING" "$CHARGING_STATE_PENDING" 2>/dev/null
     cp -f "$source_backup" "$CHARGING_BACKUP_PENDING" || return 1
     chmod 0600 "$CHARGING_BACKUP_PENDING" 2>/dev/null || return 1
-    charging_state_write_file "$CHARGING_STATE_PENDING" "$slot" \
-        "$original_hash" "$patched_hash" "$image_size" "$pps55" "$pd_qc_27w" || return 1
+    if [ "$baseline_only" = 1 ]; then
+        charging_state_write_baseline_file "$CHARGING_STATE_PENDING" "$slot" \
+            "$original_hash" "$image_size" || return 1
+    else
+        charging_state_write_file "$CHARGING_STATE_PENDING" "$slot" \
+            "$original_hash" "$patched_hash" "$image_size" "$pps55" "$pd_qc_27w" || return 1
+    fi
     charging_state_load_pair "$CHARGING_STATE_PENDING" "$CHARGING_BACKUP_PENDING" || return 1
     mv -f "$CHARGING_BACKUP_PENDING" "$CHARGING_BACKUP" || return 1
     mv -f "$CHARGING_STATE_PENDING" "$CHARGING_STATE_FILE" || return 1
@@ -797,20 +1022,29 @@ charging_symbol_path() {
 }
 
 charging_normalize_hex_list() {
-    local list="$1" token normalized output=
-    for token in $list; do
-        token="${token#0x}"
-        token="$(printf '%s' "$token" | tr 'A-F' 'a-f')"
-        case "$token" in ''|*[!0-9a-f]*) return 1 ;; esac
-        normalized="$token"
-        while [ "${normalized#0}" != "$normalized" ]; do
-            normalized="${normalized#0}"
-        done
-        [ -n "$normalized" ] || normalized=0
-        output="$output $normalized"
-    done
-    [ -n "$output" ] || return 1
-    printf '%s\n' "${output# }"
+    printf '%s\n' "$1" | awk '
+        {
+            for (field_index = 1; field_index <= NF; field_index++) {
+                value = tolower($field_index)
+                sub(/^0x/, "", value)
+                if (value == "" || value ~ /[^0-9a-f]/) {
+                    invalid = 1
+                    exit
+                }
+                sub(/^0+/, "", value)
+                if (value == "") {
+                    value = "0"
+                }
+                output = output (output == "" ? "" : " ") value
+            }
+        }
+        END {
+            if (invalid || output == "") {
+                exit 1
+            }
+            print output
+        }
+    '
 }
 
 charging_hex_lists_equal() {
@@ -818,6 +1052,54 @@ charging_hex_lists_equal() {
     expected="$(charging_normalize_hex_list "$1")" || return 1
     actual="$(charging_normalize_hex_list "$2")" || return 1
     [ "$expected" = "$actual" ]
+}
+
+charging_compare_hex_line_files() {
+    local expected_file="$1" actual_file="$2"
+    awk -v expected_file="$expected_file" -v actual_file="$actual_file" '
+        function normalize(line, count, fields, field_index, value, output) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            if (line == "") {
+                invalid = 1
+                return ""
+            }
+            count = split(line, fields, /[[:space:]]+/)
+            output = ""
+            for (field_index = 1; field_index <= count; field_index++) {
+                value = tolower(fields[field_index])
+                sub(/^0x/, "", value)
+                if (value == "" || value ~ /[^0-9a-f]/) {
+                    invalid = 1
+                    return ""
+                }
+                sub(/^0+/, "", value)
+                if (value == "") {
+                    value = "0"
+                }
+                output = output (output == "" ? "" : " ") value
+            }
+            return output
+        }
+        BEGIN {
+            while ((getline line < expected_file) > 0) {
+                expected_count++
+                expected[expected_count] = normalize(line)
+            }
+            close(expected_file)
+            while ((getline line < actual_file) > 0) {
+                actual_count++
+                if (actual_count > expected_count ||
+                        normalize(line) != expected[actual_count]) {
+                    mismatch = 1
+                }
+            }
+            close(actual_file)
+            if (invalid || mismatch || expected_count == 0 ||
+                    actual_count != expected_count) {
+                exit 1
+            }
+        }
+    '
 }
 
 charging_is_target_dtb() {
@@ -833,7 +1115,7 @@ charging_is_target_dtb() {
 }
 
 charging_apply_pps_cells() {
-    local dtb="$1" base rel prop values node actual
+    local dtb="$1" base rel prop values node
     local current=0 total label phase_started
     base="$(charging_symbol_path "$dtb" oplus_pps_charge)" || return 1
     case "$base" in /fragment@*/__overlay__/*) ;; *) return 1 ;; esac
@@ -855,8 +1137,6 @@ charging_apply_pps_cells() {
         # values is a trusted, repository-owned list of hexadecimal cells.
         # shellcheck disable=SC2086
         "$CHARGING_FDTPUT" -t x "$dtb" "$node" "$prop" $values >/dev/null 2>&1 || return 1
-        actual="$("$CHARGING_FDTGET" -t x "$dtb" "$node" "$prop" 2>/dev/null)" || return 1
-        charging_hex_lists_equal "$values" "$actual" || return 1
         current=$((current + 1))
         if charging_progress_checkpoint "$current" "$total"; then
             charging_progress_elapsed "$phase_started" "PPS 参数写入 $label：$current/$total"
@@ -867,7 +1147,7 @@ charging_apply_pps_cells() {
 }
 
 charging_verify_pps_cells() {
-    local dtb="$1" base rel prop values node actual
+    local dtb="$1" base rel prop values node work expected_file actual_file
     local current=0 total label phase_started
     base="$(charging_symbol_path "$dtb" oplus_pps_charge)" || return 1
     case "$base" in /fragment@*/__overlay__/*) ;; *) return 1 ;; esac
@@ -876,22 +1156,50 @@ charging_verify_pps_cells() {
     label="${dtb##*/}"
     phase_started="$(charging_epoch_seconds 2>/dev/null)" || phase_started=
     charging_progress_elapsed "$phase_started" "PPS 参数复核 $label：0/$total"
+    work="${dtb}.pps_verify.$$"
+    expected_file="$work/expected.hex"
+    actual_file="$work/actual.hex"
+    rm -rf "$work"
+    mkdir -p "$work" || return 1
+    : > "$expected_file" || {
+        rm -rf "$work"
+        return 1
+    }
+    set -- "$CHARGING_FDTGET" -t x "$dtb"
     while read -r rel prop values; do
         case "$rel" in ''|'#'*) continue ;; esac
-        [ -n "$prop" ] && [ -n "$values" ] || return 1
+        [ -n "$prop" ] && [ -n "$values" ] || {
+            rm -rf "$work"
+            return 1
+        }
         if [ "$rel" = . ]; then
             node="$base"
         else
             node="$base$rel"
         fi
-        actual="$("$CHARGING_FDTGET" -t x "$dtb" "$node" "$prop" 2>/dev/null)" || return 1
-        charging_hex_lists_equal "$values" "$actual" || return 1
+        set -- "$@" "$node" "$prop"
+        printf '%s\n' "$values" >> "$expected_file" || {
+            rm -rf "$work"
+            return 1
+        }
         current=$((current + 1))
-        if charging_progress_checkpoint "$current" "$total"; then
-            charging_progress_elapsed "$phase_started" "PPS 参数复核 $label：$current/$total"
-        fi
     done < "$CHARGING_PPS_CELLS"
-    [ "$current" -eq "$total" ] || return 1
+    [ "$current" -eq "$total" ] || {
+        rm -rf "$work"
+        return 1
+    }
+    "$@" > "$actual_file" 2>/dev/null || {
+        rm -rf "$work"
+        return 1
+    }
+    charging_progress_elapsed "$phase_started" \
+        "PPS 参数复核 $label：已批量读取 $total/$total，正在比较"
+    charging_compare_hex_line_files "$expected_file" "$actual_file" || {
+        rm -rf "$work"
+        return 1
+    }
+    rm -rf "$work"
+    charging_progress_elapsed "$phase_started" "PPS 参数复核 $label：$total/$total"
     return 0
 }
 
@@ -932,7 +1240,7 @@ charging_patch_protocol_list() {
 }
 
 charging_patch_fcc_property() {
-    local dtb="$1" node="$2" prop="$3" values new value actual index=0
+    local dtb="$1" node="$2" prop="$3" values new value index=0
     values="$("$CHARGING_FDTGET" -t x "$dtb" "$node" "$prop" 2>/dev/null)" || return 1
     new=
     for value in $values; do
@@ -944,9 +1252,20 @@ charging_patch_fcc_property() {
     done
     [ "$index" -eq 63 ] || return 1
     # shellcheck disable=SC2086
-    "$CHARGING_FDTPUT" -t x "$dtb" "$node" "$prop" $new >/dev/null 2>&1 || return 1
-    actual="$("$CHARGING_FDTGET" -t x "$dtb" "$node" "$prop" 2>/dev/null)" || return 1
-    charging_hex_lists_equal "$new" "$actual"
+    "$CHARGING_FDTPUT" -t x "$dtb" "$node" "$prop" $new >/dev/null 2>&1
+}
+
+charging_patch_pdqc_cool_down_current() {
+    local dtb="$1" node="$2" prop=oplus_spec,cool_down_pdqc_curr_ma
+    local values
+    values="$("$CHARGING_FDTGET" -t x "$dtb" "$node" "$prop" 2>/dev/null)" || return 1
+    # PJZ110 A15 的 PD/QC 表只有 1200/1500/2000mA 三级；ColorOS 常写入
+    # cool_down=5/7，驱动会把超范围等级截到最后一级，因而旧补丁仍被卡在 2A。
+    # 仅抬高最后一级，保留 1/2 级的 1200/1500mA 降温保护。
+    charging_hex_lists_equal "4b0 5dc 7d0" "$values" ||
+        charging_hex_lists_equal "4b0 5dc bb8" "$values" || return 1
+    "$CHARGING_FDTPUT" -t x "$dtb" "$node" "$prop" \
+        4b0 5dc bb8 >/dev/null 2>&1
 }
 
 charging_patch_wired_node() {
@@ -962,6 +1281,7 @@ charging_patch_wired_node() {
     "$CHARGING_FDTPUT" -t x "$dtb" "$node" oplus_spec,input-power-mw \
         "$1" "$2" "$3" "$4" "$5" 6978 6978 >/dev/null 2>&1 || return 1
 
+    charging_patch_pdqc_cool_down_current "$dtb" "$node" || return 1
     charging_patch_fcc_property "$dtb" "$node" oplus_spec,fccmax-ma-lv || return 1
     charging_patch_fcc_property "$dtb" "$node" oplus_spec,fccmax-ma-hv || return 1
     return 0
@@ -1018,6 +1338,8 @@ charging_verify_wired_node() {
     values="$("$CHARGING_FDTGET" -t x "$dtb" "$node" oplus_spec,input-power-mw 2>/dev/null)" || return 1
     set -- $values
     [ "$#" -eq 7 ] && [ "$6" = 6978 ] && [ "$7" = 6978 ] || return 1
+    values="$("$CHARGING_FDTGET" -t x "$dtb" "$node" oplus_spec,cool_down_pdqc_curr_ma 2>/dev/null)" || return 1
+    charging_hex_lists_equal "4b0 5dc bb8" "$values" || return 1
     charging_verify_fcc_property "$dtb" "$node" oplus_spec,fccmax-ma-lv "$rel" || return 1
     charging_verify_fcc_property "$dtb" "$node" oplus_spec,fccmax-ma-hv "$rel" || return 1
     return 0
@@ -1051,7 +1373,7 @@ charging_patch_dtb() {
     charging_progress "$label：正在更新协议功率声明"
     charging_patch_protocol_list "$dtb" || return 1
     if [ "${PD_QC_27W_ENABLE:-0}" = 1 ]; then
-        charging_progress "$label：正在写入 PD/QC 电流与 FCC 参数"
+        charging_progress "$label：正在写入 PD/QC 电流、降温表与 FCC 参数"
         charging_patch_wired "$dtb" || return 1
     fi
     charging_progress "$label：正在完整复核修改结果"
@@ -1091,13 +1413,10 @@ charging_read_u32() {
     printf '%s\n' "$((0x$value))"
 }
 
-charging_verify_container() {
-    local base="$1" output="$2" work="$3" expected_count="$4"
+charging_verify_container_layout() {
+    local base="$1" output="$2" expected_count="$3"
     local field base_value output_value entry_size entry_count entries_offset metadata_size
-    local index metadata_offset base_metadata output_metadata before_hash after_hash verify_dir
-    local phase_started
-    phase_started="$(charging_epoch_seconds 2>/dev/null)" || phase_started=
-    charging_progress_elapsed "$phase_started" "容器复核：正在校验 DT table 头和条目元数据"
+    local index metadata_offset base_metadata output_metadata
 
     # total_size 和每个 dt_size/dt_offset 会随属性长度变化；其余容器字段必须保持一致。
     for field in 0 8 12 16 20 24 28; do
@@ -1120,24 +1439,34 @@ charging_verify_container() {
         [ "$base_metadata" = "$output_metadata" ] || return 1
         index=$((index + 1))
     done
+    return 0
+}
+
+charging_verify_container() {
+    local base="$1" output="$2" work="$3" expected_count="$4"
+    local index before_hash after_hash verify_dir phase_started
+    phase_started="$(charging_epoch_seconds 2>/dev/null)" || phase_started=
+    charging_progress_elapsed "$phase_started" "容器复核：正在校验 DT table 头和条目元数据"
+    charging_verify_container_layout "$base" "$output" "$expected_count" || return 1
 
     verify_dir="$work/verify"
     rm -rf "$verify_dir"
     mkdir -p "$verify_dir" || return 1
-    charging_progress_elapsed "$phase_started" "容器复核：正在重新拆包 $entry_count 个子镜像"
+    charging_progress_elapsed "$phase_started" "容器复核：正在重新拆包 $expected_count 个子镜像"
     "$CHARGING_MKDTIMG" dump "$output" -b "$verify_dir/dtb" >/dev/null 2>&1 || return 1
     index=0
-    while [ "$index" -lt "$entry_count" ]; do
+    while [ "$index" -lt "$expected_count" ]; do
         charging_progress_elapsed "$phase_started" \
-            "容器复核：正在比较子镜像 $((index + 1))/$entry_count"
+            "容器复核：正在比较子镜像 $((index + 1))/$expected_count"
         [ -f "$work/dtb/dtb.$index" ] && [ -f "$verify_dir/dtb.$index" ] || return 1
         before_hash="$(charging_sha256 "$work/dtb/dtb.$index")" || return 1
         after_hash="$(charging_sha256 "$verify_dir/dtb.$index")" || return 1
         [ "$before_hash" = "$after_hash" ] || return 1
         index=$((index + 1))
     done
-    [ ! -e "$verify_dir/dtb.$entry_count" ] || return 1
-    charging_progress_elapsed "$phase_started" "容器复核完成：$entry_count/$entry_count"
+    [ ! -e "$verify_dir/dtb.$expected_count" ] || return 1
+    charging_progress_elapsed "$phase_started" \
+        "容器复核完成：$expected_count/$expected_count"
     return 0
 }
 
@@ -1201,10 +1530,8 @@ charging_prepare_base() {
         return 1
     fi
 
-    cp -f "$current" "$base" || return 1
-    CHARGING_ORIGINAL_HASH="$current_hash"
-    CHARGING_ORIGINAL_SIZE="$(charging_file_size "$current")"
-    return 0
+    charging_fail "当前槽位尚未建立可信原始 DTBO 备份；拒绝在生成补丁时临时把当前分区定义成原始基线"
+    return 1
 }
 
 charging_build_image() {
@@ -1262,19 +1589,9 @@ charging_build_image() {
         charging_fail "重打包 DTBO 的容器头、条目元数据、顺序或子镜像校验失败"
         return 1
     }
-    charging_progress_elapsed "$build_started" "正在校验裸 DTBO 容器"
-    avb_validate_raw_dtbo "$raw" || {
-        charging_fail "裸 DTBO 容器校验失败：$AVB_ERROR"
-        return 1
-    }
     charging_progress_elapsed "$build_started" "正在构建分区大小的 AVB 候选镜像并执行内部校验"
     avb_build_dtbo_image "$base" "$raw" "$output" || {
         charging_fail "AVB-aware DTBO 镜像构建失败：$AVB_ERROR"
-        return 1
-    }
-    charging_progress_elapsed "$build_started" "正在执行最终 AVB 候选镜像复核"
-    avb_verify_dtbo_image "$base" "$raw" "$output" || {
-        charging_fail "AVB-aware DTBO 镜像复核失败：$AVB_ERROR"
         return 1
     }
     CHARGING_SELECTED_DTB_COUNT="$selected"
@@ -1372,11 +1689,11 @@ charging_prepared_field() {
 }
 
 charging_prepared_load_dir() {
-    local dir="$1" enforce_config="${2:-1}" verify_avb="${3:-1}"
+    local dir="$1" enforce_context="${2:-1}" verify_avb="${3:-1}"
     local file base raw image rollback
     local value actual_hash actual_size
 
-    case "$enforce_config:$verify_avb" in 0:0|0:1|1:0|1:1) ;; *) return 1 ;; esac
+    case "$enforce_context:$verify_avb" in 0:0|0:1|1:0|1:1) ;; *) return 1 ;; esac
 
     file="$dir/prepare.conf"
     base="$dir/base.img"
@@ -1386,9 +1703,13 @@ charging_prepared_load_dir() {
 
     [ -r "$file" ] && [ -r "$base" ] && [ -r "$raw" ] && [ -r "$image" ] && \
         [ -r "$rollback" ] || return 1
-    [ "$(charging_prepared_field format "$file")" = 1 ] || return 1
+    [ "$(charging_prepared_field format "$file")" = 2 ] || return 1
 
     CHARGING_PREPARED_SLOT="$(charging_prepared_field slot "$file")"
+    CHARGING_PREPARED_CONFIG_HASH="$(charging_prepared_field config_sha256 "$file")"
+    CHARGING_PREPARED_RECIPE_HASH="$(charging_prepared_field recipe_sha256 "$file")"
+    CHARGING_PREPARED_FINGERPRINT_HASH="$(charging_prepared_field fingerprint_sha256 "$file")"
+    CHARGING_PREPARED_GENERATED_AT="$(charging_prepared_field generated_at "$file")"
     CHARGING_PREPARED_LIVE_HASH="$(charging_prepared_field live_sha256 "$file")"
     CHARGING_PREPARED_ORIGINAL_HASH="$(charging_prepared_field original_sha256 "$file")"
     CHARGING_PREPARED_IMAGE_SIZE="$(charging_prepared_field image_size "$file")"
@@ -1398,13 +1719,22 @@ charging_prepared_load_dir() {
     CHARGING_PREPARED_PD_QC_27W="$(charging_prepared_field pd_qc_27w "$file")"
     CHARGING_PREPARED_SELECTED_COUNT="$(charging_prepared_field selected_dtb_count "$file")"
     CHARGING_PREPARED_TOTAL_COUNT="$(charging_prepared_field total_dtb_count "$file")"
+    CHARGING_PREPARED_VERIFICATION="$(charging_prepared_field verification "$file")"
+    CHARGING_PREPARED_VERIFIED_HASH="$(charging_prepared_field verified_patched_sha256 "$file")"
+    CHARGING_PREPARED_VERIFIED_AT="$(charging_prepared_field verified_at "$file")"
 
     [ "$CHARGING_PREPARED_SLOT" = "$CHARGING_SELECTED_SLOT" ] || return 1
-    for value in "$CHARGING_PREPARED_LIVE_HASH" "$CHARGING_PREPARED_ORIGINAL_HASH" \
-        "$CHARGING_PREPARED_RAW_HASH" "$CHARGING_PREPARED_PATCHED_HASH"; do
+    for value in "$CHARGING_PREPARED_CONFIG_HASH" "$CHARGING_PREPARED_RECIPE_HASH" \
+        "$CHARGING_PREPARED_FINGERPRINT_HASH" "$CHARGING_PREPARED_LIVE_HASH" \
+        "$CHARGING_PREPARED_ORIGINAL_HASH" "$CHARGING_PREPARED_RAW_HASH" \
+        "$CHARGING_PREPARED_PATCHED_HASH" "$CHARGING_PREPARED_VERIFIED_HASH"; do
         [ "${#value}" -eq 64 ] || return 1
         case "$value" in *[!0-9a-f]*) return 1 ;; esac
     done
+    [ "$CHARGING_PREPARED_VERIFICATION" = "$CHARGING_CANDIDATE_VERIFICATION_SCHEME" ] || return 1
+    [ "$CHARGING_PREPARED_VERIFIED_HASH" = "$CHARGING_PREPARED_PATCHED_HASH" ] || return 1
+    case "$CHARGING_PREPARED_GENERATED_AT" in ''|*[!0-9]*) return 1 ;; esac
+    case "$CHARGING_PREPARED_VERIFIED_AT" in ''|*[!0-9]*) return 1 ;; esac
     case "$CHARGING_PREPARED_IMAGE_SIZE" in ''|*[!0-9]*) return 1 ;; esac
     case "$CHARGING_PREPARED_SELECTED_COUNT" in ''|*[!0-9]*) return 1 ;; esac
     case "$CHARGING_PREPARED_TOTAL_COUNT" in ''|*[!0-9]*) return 1 ;; esac
@@ -1412,9 +1742,8 @@ charging_prepared_load_dir() {
         [ "$CHARGING_PREPARED_SELECTED_COUNT" -le "$CHARGING_PREPARED_TOTAL_COUNT" ] || return 1
     charging_is_bool "$CHARGING_PREPARED_PPS55" || return 1
     charging_is_bool "$CHARGING_PREPARED_PD_QC_27W" || return 1
-    if [ "$enforce_config" = 1 ]; then
-        [ "$CHARGING_PREPARED_PPS55" = "${PPS55_ENABLE:-0}" ] || return 1
-        [ "$CHARGING_PREPARED_PD_QC_27W" = "${PD_QC_27W_ENABLE:-0}" ] || return 1
+    if [ "$enforce_context" = 1 ]; then
+        charging_prepared_context_matches || return 1
     fi
 
     actual_hash="$(charging_sha256 "$base")" || return 1
@@ -1432,9 +1761,355 @@ charging_prepared_load_dir() {
     actual_size="$(charging_file_size "$rollback")"
     [ "$actual_size" = "$CHARGING_PREPARED_IMAGE_SIZE" ] || return 1
     if [ "$verify_avb" = 1 ]; then
-        avb_validate_raw_dtbo "$raw" || return 1
         avb_verify_dtbo_image "$base" "$raw" "$image" || return 1
     fi
+    return 0
+}
+
+charging_prepared_context_matches() {
+    local config_hash recipe_hash fingerprint_hash
+    config_hash="$(charging_config_hash)" || return 1
+    recipe_hash="$(charging_recipe_hash)" || return 1
+    fingerprint_hash="$(charging_system_fingerprint_hash)" || return 1
+    [ "$CHARGING_PREPARED_CONFIG_HASH" = "$config_hash" ] || return 1
+    [ "$CHARGING_PREPARED_RECIPE_HASH" = "$recipe_hash" ] || return 1
+    [ "$CHARGING_PREPARED_FINGERPRINT_HASH" = "$fingerprint_hash" ] || return 1
+    [ "$CHARGING_PREPARED_PPS55" = "${PPS55_ENABLE:-0}" ] || return 1
+    [ "$CHARGING_PREPARED_PD_QC_27W" = "${PD_QC_27W_ENABLE:-0}" ] || return 1
+    return 0
+}
+
+charging_verify_protocol_list_delta() {
+    local base="$1" candidate="$2" base_cpa candidate_cpa
+    local base_values candidate_values expected= type power type_key
+    local found_pps=0 found_pd=0 found_qc=0
+    base_cpa="$(charging_symbol_path "$base" oplus_cpa)" || return 1
+    candidate_cpa="$(charging_symbol_path "$candidate" oplus_cpa)" || return 1
+    [ "$base_cpa" = "$candidate_cpa" ] || return 1
+    base_values="$("$CHARGING_FDTGET" -t x "$base" "$base_cpa" \
+        oplus,protocol_list 2>/dev/null)" || return 1
+    candidate_values="$("$CHARGING_FDTGET" -t x "$candidate" "$candidate_cpa" \
+        oplus,protocol_list 2>/dev/null)" || return 1
+    set -- $base_values
+    [ "$#" -gt 0 ] && [ $(( $# % 2 )) -eq 0 ] || return 1
+    while [ "$#" -gt 0 ]; do
+        type="$1"
+        power="$2"
+        shift 2
+        type_key="$(charging_normalize_hex_list "$type")" || return 1
+        case "$type_key" in
+            2)
+                found_pps=1
+                [ "${PPS55_ENABLE:-0}" = 1 ] && power=37
+                ;;
+            1)
+                found_pd=1
+                [ "${PD_QC_27W_ENABLE:-0}" = 1 ] && power=1b
+                ;;
+            5)
+                found_qc=1
+                [ "${PD_QC_27W_ENABLE:-0}" = 1 ] && power=1b
+                ;;
+        esac
+        expected="$expected $type $power"
+    done
+    [ "${PPS55_ENABLE:-0}" = 0 ] || [ "$found_pps" = 1 ] || return 1
+    if [ "${PD_QC_27W_ENABLE:-0}" = 1 ]; then
+        [ "$found_pd" = 1 ] && [ "$found_qc" = 1 ] || return 1
+    fi
+    charging_hex_lists_equal "${expected# }" "$candidate_values"
+}
+
+charging_verify_wired_node_delta() {
+    local base="$1" candidate="$2" base_node="$3" candidate_node="$4" rel="$5"
+    local values expected actual
+    "$CHARGING_FDTGET" -t x "$base" "$base_node" \
+        oplus_spec,pd-iclmax-ma >/dev/null 2>&1 || return 1
+    "$CHARGING_FDTGET" -t x "$base" "$base_node" \
+        oplus_spec,qc-iclmax-ma >/dev/null 2>&1 || return 1
+    values="$("$CHARGING_FDTGET" -t x "$base" "$base_node" \
+        oplus_spec,input-power-mw 2>/dev/null)" || return 1
+    set -- $values
+    [ "$#" -eq 7 ] || return 1
+    expected="$1 $2 $3 $4 $5 6978 6978"
+    actual="$("$CHARGING_FDTGET" -t x "$candidate" "$candidate_node" \
+        oplus_spec,input-power-mw 2>/dev/null)" || return 1
+    charging_hex_lists_equal "$expected" "$actual" || return 1
+    values="$("$CHARGING_FDTGET" -t x "$base" "$base_node" \
+        oplus_spec,cool_down_pdqc_curr_ma 2>/dev/null)" || return 1
+    charging_hex_lists_equal "4b0 5dc 7d0" "$values" || \
+        charging_hex_lists_equal "4b0 5dc bb8" "$values" || return 1
+    charging_verify_wired_node "$candidate" "$candidate_node" "$rel"
+}
+
+charging_allow_property() {
+    printf '%s\t%s\n' "$2" "$3" >> "$1"
+}
+
+charging_build_target_allowlist() {
+    local base="$1" candidate="$2" output="$3"
+    local base_cpa candidate_cpa base_pps candidate_pps base_wired candidate_wired
+    local rel prop values node candidate_node
+    : > "$output" || return 1
+
+    base_cpa="$(charging_symbol_path "$base" oplus_cpa)" || return 1
+    candidate_cpa="$(charging_symbol_path "$candidate" oplus_cpa)" || return 1
+    [ "$base_cpa" = "$candidate_cpa" ] || return 1
+    charging_allow_property "$output" "$base_cpa" oplus,protocol_list || return 1
+
+    if [ "${PPS55_ENABLE:-0}" = 1 ]; then
+        base_pps="$(charging_symbol_path "$base" oplus_pps_charge)" || return 1
+        candidate_pps="$(charging_symbol_path "$candidate" oplus_pps_charge)" || return 1
+        [ "$base_pps" = "$candidate_pps" ] || return 1
+        while read -r rel prop values; do
+            case "$rel" in ''|'#'*) continue ;; esac
+            [ -n "$prop" ] && [ -n "$values" ] || return 1
+            if [ "$rel" = . ]; then
+                node="$base_pps"
+            else
+                node="$base_pps$rel"
+            fi
+            charging_allow_property "$output" "$node" "$prop" || return 1
+        done < "$CHARGING_PPS_CELLS"
+    fi
+
+    if [ "${PD_QC_27W_ENABLE:-0}" = 1 ]; then
+        base_wired="$(charging_symbol_path "$base" oplus_chg_wired)" || return 1
+        candidate_wired="$(charging_symbol_path "$candidate" oplus_chg_wired)" || return 1
+        [ "$base_wired" = "$candidate_wired" ] || return 1
+        for rel in . /silicon_p_770; do
+            if [ "$rel" = . ]; then
+                node="$base_wired"
+                candidate_node="$candidate_wired"
+            else
+                node="$base_wired$rel"
+                candidate_node="$candidate_wired$rel"
+            fi
+            [ "$node" = "$candidate_node" ] || return 1
+            for prop in \
+                oplus_spec,pd-iclmax-ma \
+                oplus_spec,qc-iclmax-ma \
+                oplus_spec,input-power-mw \
+                oplus_spec,cool_down_pdqc_curr_ma \
+                oplus_spec,fccmax-ma-lv \
+                oplus_spec,fccmax-ma-hv; do
+                charging_allow_property "$output" "$node" "$prop" || return 1
+            done
+        done
+    fi
+    LC_ALL=C sort -u "$output" > "$output.sorted" || return 1
+    mv -f "$output.sorted" "$output"
+}
+
+charging_verify_binary_allowlist_delta() {
+    local base="$1" candidate="$2" allowlist="$3" work="$4" verify_started="$5"
+    local normalized base_values restore_rows tab node prop property_values
+    local count=0 current=0
+    normalized="$work/candidate.normalized.dtb"
+    base_values="$work/base-allowed.values"
+    restore_rows="$work/restore.tsv"
+    cp -f "$candidate" "$normalized" || {
+        charging_fail "白名单复核失败：无法建立候选归一化副本"
+        return 1
+    }
+
+    set -- "$CHARGING_FDTGET" -t bx "$base"
+    tab="$(printf '\t')"
+    while IFS="$tab" read -r node prop; do
+        [ -n "$node" ] && [ -n "$prop" ] || {
+            charging_fail "白名单复核失败：允许修改的属性清单格式错误"
+            return 1
+        }
+        set -- "$@" "$node" "$prop"
+        count=$((count + 1))
+    done < "$allowlist"
+    [ "$count" -gt 0 ] || {
+        charging_fail "白名单复核失败：允许修改的属性清单为空"
+        return 1
+    }
+
+    charging_progress_elapsed "$verify_started" \
+        "白名单复核：正在从原始目标 DTB 批量读取 $count 个允许修改属性的原始字节"
+    "$@" > "$base_values" 2>/dev/null || {
+        charging_fail "白名单复核失败：无法批量读取原始属性；清单可能与基线不匹配"
+        return 1
+    }
+    awk -F '\t' '
+        NR == FNR {
+            nodes[FNR] = $1
+            props[FNR] = $2
+            count = FNR
+            next
+        }
+        {
+            value_count++
+            if (value_count <= count) {
+                printf "%s\t%s\t%s\n", nodes[value_count], props[value_count], $0
+            }
+        }
+        END {
+            if (count == 0 || value_count != count) {
+                exit 1
+            }
+        }
+    ' "$allowlist" "$base_values" > "$restore_rows" || {
+        charging_fail "白名单复核失败：原始属性数量与白名单不一致"
+        return 1
+    }
+
+    charging_progress_elapsed "$verify_started" \
+        "白名单复核：正在把候选副本反向归一化为原始属性，0/$count"
+    while IFS="$tab" read -r node prop property_values; do
+        [ -n "$node" ] && [ -n "$prop" ] || {
+            charging_fail "白名单复核失败：反向归一化数据格式错误"
+            return 1
+        }
+        # property_values is hexadecimal byte data emitted by the trusted fdtget binary.
+        # shellcheck disable=SC2086
+        "$CHARGING_FDTPUT" -t bx "$normalized" "$node" "$prop" \
+            $property_values >/dev/null 2>&1 || {
+            charging_fail "白名单复核失败：无法恢复 $node/$prop 的原始字节"
+            return 1
+        }
+        current=$((current + 1))
+        if charging_progress_checkpoint "$current" "$count" 25; then
+            charging_progress_elapsed "$verify_started" \
+                "白名单复核：候选副本反向归一化 $current/$count"
+        fi
+    done < "$restore_rows"
+    [ "$current" -eq "$count" ] || {
+        charging_fail "白名单复核失败：反向归一化属性数量不完整"
+        return 1
+    }
+
+    charging_progress_elapsed "$verify_started" \
+        "白名单复核：正在完整比较原始目标 DTB 与反向归一化候选"
+    cmp -s "$base" "$normalized" || {
+        charging_fail "白名单复核失败：候选在允许修改的属性之外仍存在二进制差异"
+        return 1
+    }
+    charging_progress_elapsed "$verify_started" \
+        "白名单复核通过：反向恢复白名单属性后，候选与原始目标 DTB 完全一致"
+    return 0
+}
+
+charging_verify_target_dtb_delta() {
+    local base="$1" candidate="$2" work="$3"
+    local allowlist
+    local base_wired candidate_wired rel base_node candidate_node verify_started
+    allowlist="$work/allowed.tsv"
+    verify_started="$(charging_epoch_seconds 2>/dev/null)" || verify_started=
+
+    charging_progress_elapsed "$verify_started" \
+        "白名单复核：正在确认协议、PPS 与 PD/QC 目标属性"
+    charging_build_target_allowlist "$base" "$candidate" "$allowlist" || return 1
+    charging_verify_protocol_list_delta "$base" "$candidate" || return 1
+    charging_verify_dtb "$candidate" || return 1
+    if [ "${PD_QC_27W_ENABLE:-0}" = 1 ]; then
+        base_wired="$(charging_symbol_path "$base" oplus_chg_wired)" || return 1
+        candidate_wired="$(charging_symbol_path "$candidate" oplus_chg_wired)" || return 1
+        [ "$base_wired" = "$candidate_wired" ] || return 1
+        for rel in . /silicon_p_770; do
+            if [ "$rel" = . ]; then
+                base_node="$base_wired"
+                candidate_node="$candidate_wired"
+            else
+                base_node="$base_wired$rel"
+                candidate_node="$candidate_wired$rel"
+            fi
+            charging_verify_wired_node_delta \
+                "$base" "$candidate" "$base_node" "$candidate_node" "$rel" || return 1
+        done
+    fi
+    charging_verify_binary_allowlist_delta \
+        "$base" "$candidate" "$allowlist" "$work" "$verify_started"
+}
+
+charging_verify_candidate_semantics() {
+    local base="$1" raw="$2" image="$3" expected_selected="$4" expected_total="$5" work="$6"
+    local base_dir candidate_dir index=0 selected=0 base_total=0 candidate_total=0
+    local base_dtb candidate_dtb base_target candidate_target target_work
+    rm -rf "$work"
+    base_dir="$work/base"
+    candidate_dir="$work/candidate"
+    mkdir -p "$base_dir" "$candidate_dir" || return 1
+    charging_verify_container_layout "$base" "$raw" "$expected_total" || return 1
+    avb_verify_dtbo_image "$base" "$raw" "$image" || return 1
+    "$CHARGING_MKDTIMG" dump "$base" -b "$base_dir/dtb" >/dev/null 2>&1 || return 1
+    "$CHARGING_MKDTIMG" dump "$raw" -b "$candidate_dir/dtb" >/dev/null 2>&1 || return 1
+    while [ -f "$base_dir/dtb.$base_total" ]; do
+        base_total=$((base_total + 1))
+    done
+    while [ -f "$candidate_dir/dtb.$candidate_total" ]; do
+        candidate_total=$((candidate_total + 1))
+    done
+    [ "$base_total" -eq "$expected_total" ] && \
+        [ "$candidate_total" -eq "$expected_total" ] || return 1
+
+    while [ "$index" -lt "$expected_total" ]; do
+        base_dtb="$base_dir/dtb.$index"
+        candidate_dtb="$candidate_dir/dtb.$index"
+        charging_progress \
+            "独立语义校验：正在核对子镜像 $((index + 1))/$expected_total"
+        base_target=0
+        candidate_target=0
+        charging_is_target_dtb "$base_dtb" && base_target=1
+        charging_is_target_dtb "$candidate_dtb" && candidate_target=1
+        [ "$base_target" = "$candidate_target" ] || return 1
+        if [ "$base_target" = 1 ]; then
+            selected=$((selected + 1))
+            target_work="$work/target_$index"
+            mkdir -p "$target_work" || return 1
+            charging_verify_target_dtb_delta \
+                "$base_dtb" "$candidate_dtb" "$target_work" || return 1
+            charging_progress \
+                "独立语义校验：目标子镜像 $((index + 1))/$expected_total 通过白名单复核"
+        else
+            cmp -s "$base_dtb" "$candidate_dtb" || {
+                charging_fail "独立语义校验失败：非目标子镜像 $((index + 1))/$expected_total 发生变化"
+                return 1
+            }
+            charging_progress \
+                "独立语义校验：非目标子镜像 $((index + 1))/$expected_total 保持不变"
+        fi
+        index=$((index + 1))
+    done
+    [ "$selected" -eq "$expected_selected" ]
+}
+
+charging_verify_prepared_candidate() {
+    local slot work verify_started result=1
+    charging_validate_request || return 1
+    slot="$(charging_active_slot)" || return 1
+    charging_select_slot_state "$slot" || return 1
+    charging_require_tools || return 1
+    charging_prepared_load_dir "$CHARGING_PREPARED_DIR" 1 0 || {
+        charging_fail "候选镜像完整性、配置、系统版本或生成规则校验失败；请重新生成"
+        return 1
+    }
+    work="$CHARGING_RESCUE_DIR/.candidate_verify_${slot#_}.$$"
+    rm -rf "$work"
+    mkdir -p "$work" || return 1
+    chmod 0700 "$work" 2>/dev/null || {
+        rm -rf "$work"
+        return 1
+    }
+    verify_started="$(charging_epoch_seconds 2>/dev/null)" || verify_started=
+    charging_progress_elapsed "$verify_started" \
+        "正在只读反向归一化候选白名单属性，并与可信基线进行完整二进制比较"
+    if charging_verify_candidate_semantics \
+        "$CHARGING_PREPARED_BASE" "$CHARGING_PREPARED_RAW" \
+        "$CHARGING_PREPARED_IMAGE" "$CHARGING_PREPARED_SELECTED_COUNT" \
+        "$CHARGING_PREPARED_TOTAL_COUNT" "$work/semantic"; then
+        result=0
+    fi
+    rm -rf "$work"
+    if [ "$result" -ne 0 ]; then
+        charging_fail "候选镜像未通过独立白名单差异校验；请重新生成"
+        return 1
+    fi
+    charging_progress_elapsed "$verify_started" \
+        "候选镜像独立复核通过：仅白名单属性按期望变化，其他内容保持不变"
     return 0
 }
 
@@ -1446,6 +2121,46 @@ charging_discard_prepared() {
             ;;
         *) return 1 ;;
     esac
+}
+
+charging_discard_prepared_candidate() {
+    local slot
+    slot="$(charging_active_slot)" || {
+        charging_fail "无法识别当前 A/B 槽位，拒绝放弃候选镜像"
+        return 1
+    }
+    charging_select_slot_state "$slot" || return 1
+    charging_operation_validate_existing || {
+        charging_fail "当前槽位的 DTBO 操作状态损坏或不可读；已保留候选与回滚文件"
+        return 1
+    }
+    if charging_slot_has_unresolved_operation; then
+        charging_fail "当前槽位存在未解决的 DTBO 写入、恢复或救援事务；禁止删除候选与回滚文件"
+        return 1
+    fi
+    charging_prepared_status_slot "$slot" || {
+        charging_fail "无法核对当前槽位的候选事务；已保留全部文件"
+        return 1
+    }
+    [ "$CHARGING_PREPARED_PRESENT" = 1 ] || {
+        charging_fail "当前活动槽位没有可放弃的候选镜像"
+        return 1
+    }
+    [ "$CHARGING_PREPARED_PROBLEM" = 0 ] && \
+        [ "$CHARGING_PREPARED_SAFE" = 1 ] || {
+        charging_fail "无法证明候选事务尚未影响未知 DTBO；已保留候选与 current.img"
+        return 1
+    }
+    charging_discard_prepared || {
+        charging_fail "候选目录清理失败；手机 DTBO 分区没有写入"
+        return 1
+    }
+    sync || {
+        charging_fail "候选目录已删除，但文件系统同步失败；手机 DTBO 分区没有写入"
+        return 1
+    }
+    charging_msg "- 已放弃槽位 $slot 的候选镜像；配置、原始备份和手机 DTBO 均未改变"
+    return 0
 }
 
 charging_slot_has_state_artifacts() {
@@ -1528,6 +2243,12 @@ charging_prepared_status_slot() {
     CHARGING_PREPARED_SAFE=0
     CHARGING_PREPARED_PROBLEM=0
     CHARGING_PREPARED_PROBLEM_DETAIL=
+    CHARGING_CANDIDATE_INTEGRITY_VALID=0
+    CHARGING_CANDIDATE_CONTEXT_VALID=0
+    CHARGING_CANDIDATE_LIVE_MATCH=0
+    CHARGING_CANDIDATE_READY=0
+    CHARGING_CANDIDATE_RELATION=unavailable
+    CHARGING_CANDIDATE_ISSUE_KIND=
     charging_select_slot_state "$slot" || return 1
     suffix="${slot#_}"
 
@@ -1537,6 +2258,7 @@ charging_prepared_status_slot() {
         [ -e "$path" ] || [ -L "$path" ] || continue
         CHARGING_PREPARED_PRESENT=1
         CHARGING_PREPARED_PROBLEM=1
+        CHARGING_CANDIDATE_ISSUE_KIND=transaction-interrupted
         CHARGING_PREPARED_PROBLEM_DETAIL="槽位 $slot 存在未完成的准备目录交换：$path"
         return 0
     done
@@ -1545,37 +2267,67 @@ charging_prepared_status_slot() {
     CHARGING_PREPARED_PRESENT=1
     if [ ! -d "$CHARGING_PREPARED_DIR" ] || [ -L "$CHARGING_PREPARED_DIR" ]; then
         CHARGING_PREPARED_PROBLEM=1
+        CHARGING_CANDIDATE_ISSUE_KIND=unsafe-path
         CHARGING_PREPARED_PROBLEM_DETAIL="槽位 $slot 的准备路径不是普通目录"
-        return 0
-    fi
-    if ! charging_prepared_load_dir "$CHARGING_PREPARED_DIR" 0 0; then
-        CHARGING_PREPARED_PROBLEM=1
-        CHARGING_PREPARED_PROBLEM_DETAIL="槽位 $slot 的 DTBO 准备事务文件不完整或校验失败"
         return 0
     fi
     part="$(charging_dtbo_partition "$slot")" || {
         CHARGING_PREPARED_PROBLEM=1
+        CHARGING_CANDIDATE_ISSUE_KIND=missing-partition
         CHARGING_PREPARED_PROBLEM_DETAIL="找不到槽位 $slot 的 DTBO 分区，无法判断准备事务是否写入"
         return 0
     }
     current_hash="$(charging_sha256 "$part")" || {
         CHARGING_PREPARED_PROBLEM=1
+        CHARGING_CANDIDATE_ISSUE_KIND=read-failed
         CHARGING_PREPARED_PROBLEM_DETAIL="无法读取槽位 $slot 的 DTBO 哈希"
         return 0
     }
-    if [ "$current_hash" = "$CHARGING_PREPARED_LIVE_HASH" ]; then
-        CHARGING_PREPARED_SAFE=1
+    if ! charging_prepared_load_dir "$CHARGING_PREPARED_DIR" 0 0; then
+        CHARGING_CANDIDATE_ISSUE_KIND=candidate-invalid
+        CHARGING_PREPARED_PROBLEM_DETAIL="槽位 $slot 的候选镜像格式过旧、文件不完整或完整性校验失败"
+        if charging_slot_has_state_artifacts && charging_state_load && \
+            [ "$CHARGING_STATE_SLOT" = "$slot" ] && charging_state_hash_owned "$current_hash"; then
+            CHARGING_PREPARED_SAFE=1
+            return 0
+        fi
+        CHARGING_PREPARED_PROBLEM=1
         return 0
     fi
-    if charging_slot_has_state_artifacts && charging_state_load && \
+    CHARGING_CANDIDATE_INTEGRITY_VALID=1
+    if [ "$current_hash" = "$CHARGING_PREPARED_PATCHED_HASH" ]; then
+        CHARGING_CANDIDATE_RELATION=same
+    else
+        CHARGING_CANDIDATE_RELATION=different
+    fi
+    if [ "$current_hash" = "$CHARGING_PREPARED_LIVE_HASH" ]; then
+        CHARGING_PREPARED_SAFE=1
+        CHARGING_CANDIDATE_LIVE_MATCH=1
+    elif charging_slot_has_state_artifacts && charging_state_load && \
         [ "$CHARGING_STATE_SLOT" = "$slot" ] && charging_state_hash_owned "$current_hash"; then
         # 正式所有权状态已经覆盖 prepared/current.img 的救援作用；恢复流程会
         # 优先按正式状态处理，成功后才删除准备目录。
         CHARGING_PREPARED_SAFE=1
+    else
+        CHARGING_PREPARED_PROBLEM=1
+        CHARGING_CANDIDATE_ISSUE_KIND=phone-changed-unknown
+        CHARGING_PREPARED_PROBLEM_DETAIL="槽位 $slot 的手机 DTBO 已偏离候选生成时镜像，且没有可验证的正式所有权状态"
         return 0
     fi
-    CHARGING_PREPARED_PROBLEM=1
-    CHARGING_PREPARED_PROBLEM_DETAIL="槽位 $slot 的 DTBO 已偏离准备时镜像，但没有可验证的正式所有权状态"
+
+    if charging_prepared_context_matches; then
+        CHARGING_CANDIDATE_CONTEXT_VALID=1
+    else
+        CHARGING_CANDIDATE_ISSUE_KIND=context-stale
+        CHARGING_PREPARED_PROBLEM_DETAIL="候选镜像与当前配置、系统版本或模块生成规则不一致"
+        return 0
+    fi
+    if [ "$CHARGING_CANDIDATE_LIVE_MATCH" != 1 ]; then
+        CHARGING_CANDIDATE_ISSUE_KIND=phone-changed
+        CHARGING_PREPARED_PROBLEM_DETAIL="手机 DTBO 在候选生成后已经变化，请重新生成候选镜像"
+        return 0
+    fi
+    CHARGING_CANDIDATE_READY=1
     return 0
 }
 
@@ -1757,9 +2509,262 @@ charging_cleanup_stale_prepared_all_for_slot() {
     charging_select_slot_state "$slot"
 }
 
+charging_backup_original_slot() {
+    local slot="$1" part capture expected_hash expected_size actual_hash actual_size suffix
+    CHARGING_BACKUP_SLOT_RESULT=
+    [ "${PFFM_LOCK_HELD:-0}" = 1 ] || {
+        charging_fail "未持有全局运行锁，拒绝处理槽位 $slot 的原始备份"
+        return 1
+    }
+    charging_select_slot_state "$slot" || return 1
+    charging_operation_validate_existing || {
+        charging_fail "槽位 $slot 的 DTBO 操作状态损坏或不可读；拒绝建立或覆盖备份"
+        return 1
+    }
+
+    if charging_slot_has_state_artifacts; then
+        charging_state_load || {
+            charging_fail "槽位 $slot 已存在但无法校验的备份/状态；为保留救援证据，拒绝覆盖"
+            return 1
+        }
+        [ "$CHARGING_STATE_SLOT" = "$slot" ] || {
+            charging_fail "槽位 $slot 的备份状态内容与路径不一致；拒绝覆盖"
+            return 1
+        }
+        CHARGING_BACKUP_SLOT_RESULT=verified
+        charging_msg "- 槽位 $slot 已有有效原始 DTBO 备份，已重新校验且未覆盖"
+        return 0
+    fi
+
+    if charging_slot_has_unresolved_operation; then
+        charging_fail "槽位 $slot 存在未解决的 DTBO 关键事务；拒绝把当前分区登记为原始备份"
+        return 1
+    fi
+    if charging_slot_has_prepared_artifacts "$slot"; then
+        charging_prepared_status_slot "$slot" || return 1
+        if [ "$CHARGING_PREPARED_PROBLEM" = 1 ] || [ "$CHARGING_PREPARED_SAFE" != 1 ]; then
+            charging_fail "槽位 $slot 存在无法证明未写分区的准备事务；拒绝建立原始备份"
+            return 1
+        fi
+    fi
+
+    part="$(charging_dtbo_partition "$slot")" || {
+        charging_fail "找不到槽位 $slot 的 DTBO 分区"
+        return 1
+    }
+    [ -r "$part" ] || {
+        charging_fail "槽位 $slot 的 DTBO 分区不可读"
+        return 1
+    }
+    expected_hash="$(charging_trusted_original_hash "$slot")" || return 1
+    expected_size="$(charging_trusted_original_size "$slot")" || return 1
+    suffix="${slot#_}"
+    charging_ensure_rescue_dir || return 1
+    # 全局锁保证同一时刻只有一个备份进程；使用固定临时名，进程中断后下一次
+    # 可以安全覆盖，不会按 PID 永久堆积 24 MiB 残留文件。
+    capture="$CHARGING_RESCUE_DIR/.original_capture_${suffix}.img"
+    rm -f "$capture"
+    if ! dd if="$part" of="$capture" bs=4096 2>/dev/null; then
+        rm -f "$capture"
+        charging_fail "读取槽位 $slot 的 DTBO 分区失败"
+        return 1
+    fi
+    chmod 0600 "$capture" 2>/dev/null || {
+        rm -f "$capture"
+        return 1
+    }
+    actual_hash="$(charging_sha256 "$capture")" || {
+        rm -f "$capture"
+        return 1
+    }
+    actual_size="$(charging_file_size "$capture")"
+    if [ "$actual_hash" != "$expected_hash" ] || [ "$actual_size" != "$expected_size" ]; then
+        rm -f "$capture"
+        charging_fail "槽位 $slot 当前 DTBO 不匹配受信任的 PJZ110 A77 原始哈希；可能已打补丁、已 OTA 或属于未知版本，拒绝冒充原始备份"
+        return 1
+    fi
+    if charging_image_has_avb_footer "$capture"; then
+        if ! avb_parse_dtbo_image "$capture"; then
+            rm -f "$capture"
+            charging_fail "槽位 $slot 的镜像带有 AVB Footer，但结构校验失败：$AVB_ERROR"
+            return 1
+        fi
+        charging_msg "- 槽位 $slot 的可信原始哈希、完整大小和 AVB Footer 均已确认"
+    else
+        charging_msg "- 槽位 $slot 的可信原始哈希和完整大小已确认；该原厂镜像不含 AVB Footer"
+    fi
+    charging_commit_original_backup "$capture" "$slot" "$actual_hash" "$actual_size" || {
+        rm -f "$capture"
+        return 1
+    }
+    rm -f "$capture"
+    charging_set_operation_phase ORIGINAL \
+        "已独立建立并校验原始 DTBO 备份；分区未修改" || return 1
+    CHARGING_BACKUP_SLOT_RESULT=created
+    charging_msg "- 槽位 $slot 的原始 DTBO 已独立备份并校验；没有写入分区"
+    return 0
+}
+
+charging_backup_original_all() {
+    local slot result=0
+    CHARGING_BACKUP_CREATED_SLOTS=
+    CHARGING_BACKUP_VERIFIED_SLOTS=
+    CHARGING_BACKUP_FAILED_SLOTS=
+    charging_preflight_backup || return 1
+    charging_import_previous_state || {
+        charging_fail "继承上一版本 DTBO 状态失败"
+        return 1
+    }
+    for slot in _a _b; do
+        if charging_backup_original_slot "$slot"; then
+            case "$CHARGING_BACKUP_SLOT_RESULT" in
+                created) CHARGING_BACKUP_CREATED_SLOTS="$CHARGING_BACKUP_CREATED_SLOTS $slot" ;;
+                verified) CHARGING_BACKUP_VERIFIED_SLOTS="$CHARGING_BACKUP_VERIFIED_SLOTS $slot" ;;
+            esac
+        else
+            CHARGING_BACKUP_FAILED_SLOTS="$CHARGING_BACKUP_FAILED_SLOTS $slot"
+            result=1
+        fi
+    done
+    if [ "$result" -ne 0 ]; then
+        charging_fail "原始 DTBO 备份未全部完成；已成功建立或校验的槽位不会回滚，失败槽位：${CHARGING_BACKUP_FAILED_SLOTS# }"
+        return 1
+    fi
+    charging_msg "- A/B 原始 DTBO 备份均已建立或通过校验；整个过程未写入分区"
+    return 0
+}
+
+charging_restore_plan_field() {
+    local key="$1"
+    sed -n "s/^${key}=//p" "$CHARGING_RESTORE_PLAN" 2>/dev/null | head -n 1
+}
+
+charging_prepare_restore_requested() {
+    local active_slot slot part current_hash original_hash
+    local config_hash recipe_hash fingerprint_hash generated_at tmp
+    local current_a= current_b= original_a= original_b=
+    charging_validate_request || return 1
+    [ "${CHARGING_DTBO_ENABLE:-0}" = 0 ] || {
+        charging_fail "当前配置仍启用充电补丁，拒绝生成恢复计划"
+        return 1
+    }
+    charging_require_backup_tools || return 1
+    charging_import_previous_state || return 1
+    active_slot="$(charging_active_slot)" || return 1
+    charging_ensure_rescue_dir || return 1
+    for slot in _a _b; do
+        charging_select_slot_state "$slot" || return 1
+        charging_operation_validate_existing || {
+            charging_fail "槽位 $slot 的操作状态损坏，拒绝生成恢复计划"
+            return 1
+        }
+        part="$(charging_dtbo_partition "$slot")" || return 1
+        current_hash="$(charging_sha256 "$part")" || return 1
+        original_hash=
+        if charging_slot_has_state_artifacts; then
+            charging_state_load || {
+                charging_fail "槽位 $slot 的原始备份或所有权状态校验失败"
+                return 1
+            }
+            [ "$CHARGING_STATE_SLOT" = "$slot" ] && \
+                charging_state_hash_owned "$current_hash" || {
+                charging_fail "槽位 $slot 的手机 DTBO 不属于原始镜像或本模块已登记补丁"
+                return 1
+            }
+            original_hash="$CHARGING_STATE_ORIGINAL_HASH"
+        elif charging_slot_has_prepared_artifacts "$slot" || \
+            charging_slot_has_unresolved_operation; then
+            charging_fail "槽位 $slot 存在未解决的候选或关键事务，拒绝生成恢复计划"
+            return 1
+        fi
+        case "$slot" in
+            _a) current_a="$current_hash"; original_a="$original_hash" ;;
+            _b) current_b="$current_hash"; original_b="$original_hash" ;;
+        esac
+    done
+    config_hash="$(charging_config_hash)" || return 1
+    recipe_hash="$(charging_recipe_hash)" || return 1
+    fingerprint_hash="$(charging_system_fingerprint_hash)" || return 1
+    generated_at="$(charging_epoch_seconds)" || return 1
+    tmp="$CHARGING_RESTORE_PLAN.tmp.$$"
+    {
+        printf 'format=1\n'
+        printf 'active_slot=%s\n' "$active_slot"
+        printf 'config_sha256=%s\n' "$config_hash"
+        printf 'recipe_sha256=%s\n' "$recipe_hash"
+        printf 'fingerprint_sha256=%s\n' "$fingerprint_hash"
+        printf 'generated_at=%s\n' "$generated_at"
+        printf 'current_a_sha256=%s\n' "$current_a"
+        printf 'current_b_sha256=%s\n' "$current_b"
+        printf 'original_a_sha256=%s\n' "$original_a"
+        printf 'original_b_sha256=%s\n' "$original_b"
+    } > "$tmp" || {
+        rm -f "$tmp"
+        return 1
+    }
+    chmod 0600 "$tmp" 2>/dev/null || {
+        rm -f "$tmp"
+        return 1
+    }
+    mv -f "$tmp" "$CHARGING_RESTORE_PLAN" || {
+        rm -f "$tmp"
+        return 1
+    }
+    sync || return 1
+    charging_msg "- 恢复条件已校验并持久化；尚未写入任何 DTBO 分区"
+    return 0
+}
+
+charging_restore_plan_load() {
+    local active_slot config_hash recipe_hash fingerprint_hash slot part current expected original
+    [ -r "$CHARGING_RESTORE_PLAN" ] || return 1
+    [ "$(charging_restore_plan_field format)" = 1 ] || return 1
+    active_slot="$(charging_active_slot)" || return 1
+    [ "$(charging_restore_plan_field active_slot)" = "$active_slot" ] || return 1
+    config_hash="$(charging_config_hash)" || return 1
+    recipe_hash="$(charging_recipe_hash)" || return 1
+    fingerprint_hash="$(charging_system_fingerprint_hash)" || return 1
+    [ "$(charging_restore_plan_field config_sha256)" = "$config_hash" ] || return 1
+    [ "$(charging_restore_plan_field recipe_sha256)" = "$recipe_hash" ] || return 1
+    [ "$(charging_restore_plan_field fingerprint_sha256)" = "$fingerprint_hash" ] || return 1
+    for slot in _a _b; do
+        charging_select_slot_state "$slot" || return 1
+        part="$(charging_dtbo_partition "$slot")" || return 1
+        current="$(charging_sha256 "$part")" || return 1
+        expected="$(charging_restore_plan_field current_${slot#_}_sha256)"
+        charging_is_sha256_value "$expected" && [ "$current" = "$expected" ] || return 1
+        original="$(charging_restore_plan_field original_${slot#_}_sha256)"
+        if [ -n "$original" ]; then
+            charging_state_load || return 1
+            [ "$CHARGING_STATE_SLOT" = "$slot" ] && \
+                [ "$CHARGING_STATE_ORIGINAL_HASH" = "$original" ] && \
+                charging_state_hash_owned "$current" || return 1
+        fi
+    done
+    return 0
+}
+
+charging_commit_restore_prepared() {
+    [ "${CHARGING_DTBO_ENABLE:-0}" = 0 ] || return 1
+    avb_require_unlocked_bootloader || {
+        charging_fail "拒绝恢复 DTBO：$AVB_ERROR"
+        return 1
+    }
+    charging_restore_plan_load || {
+        charging_fail "恢复计划与当前配置、槽位、手机 DTBO 或原始备份不再一致；请重新校验恢复条件"
+        return 1
+    }
+    charging_restore_all_owned || return 1
+    rm -f "$CHARGING_RESTORE_PLAN"
+    sync || return 1
+    return 0
+}
+
 charging_prepare_requested() {
     local slot part suffix work output raw patched_hash raw_hash state_file old_dir prepare_started
+    local config_hash recipe_hash fingerprint_hash generated_at verified_at
 
+    CHARGING_PREPARE_OUTCOME=
     charging_validate_request || return 1
     if [ "${CHARGING_DTBO_ENABLE:-0}" = 0 ] || \
         { [ "${PPS55_ENABLE:-0}" = 0 ] && [ "${PD_QC_27W_ENABLE:-0}" = 0 ]; }; then
@@ -1772,6 +2777,10 @@ charging_prepare_requested() {
         return 1
     }
     slot="$(charging_active_slot)" || return 1
+    charging_backup_original_slot "$slot" || {
+        charging_fail "当前槽位没有可验证的可信原始备份；候选镜像未生成"
+        return 1
+    }
     charging_select_slot_state "$slot" || return 1
     charging_operation_validate_existing || {
         charging_fail "槽位 $slot 的 DTBO 操作状态损坏或不可读；已保留原文件并拒绝提交候选镜像"
@@ -1812,10 +2821,31 @@ charging_prepare_requested() {
         rm -rf "$work"
         return 1
     }
+    config_hash="$(charging_config_hash)" || {
+        rm -rf "$work"
+        return 1
+    }
+    recipe_hash="$(charging_recipe_hash)" || {
+        rm -rf "$work"
+        return 1
+    }
+    fingerprint_hash="$(charging_system_fingerprint_hash)" || {
+        rm -rf "$work"
+        return 1
+    }
+    generated_at="$(charging_epoch_seconds)" || {
+        rm -rf "$work"
+        return 1
+    }
+    verified_at="$generated_at"
     state_file="$work/prepare.conf"
     {
-        printf 'format=1\n'
+        printf 'format=2\n'
         printf 'slot=%s\n' "$slot"
+        printf 'config_sha256=%s\n' "$config_hash"
+        printf 'recipe_sha256=%s\n' "$recipe_hash"
+        printf 'fingerprint_sha256=%s\n' "$fingerprint_hash"
+        printf 'generated_at=%s\n' "$generated_at"
         printf 'live_sha256=%s\n' "$CHARGING_CURRENT_HASH"
         printf 'original_sha256=%s\n' "$CHARGING_ORIGINAL_HASH"
         printf 'image_size=%s\n' "$CHARGING_ORIGINAL_SIZE"
@@ -1825,6 +2855,9 @@ charging_prepare_requested() {
         printf 'pd_qc_27w=%s\n' "${PD_QC_27W_ENABLE:-0}"
         printf 'selected_dtb_count=%s\n' "$CHARGING_SELECTED_DTB_COUNT"
         printf 'total_dtb_count=%s\n' "$CHARGING_TOTAL_DTB_COUNT"
+        printf 'verification=%s\n' "$CHARGING_CANDIDATE_VERIFICATION_SCHEME"
+        printf 'verified_patched_sha256=%s\n' "$patched_hash"
+        printf 'verified_at=%s\n' "$verified_at"
     } > "$state_file" || {
         rm -rf "$work"
         return 1
@@ -1834,12 +2867,21 @@ charging_prepare_requested() {
         return 1
     }
     charging_progress_elapsed "$prepare_started" "- 正在复核临时离线准备事务"
-    charging_prepared_load_dir "$work" || {
+    charging_prepared_load_dir "$work" 1 0 || {
         rm -rf "$work"
         charging_fail "离线生成的 DTBO 准备事务复核失败：${AVB_ERROR:-metadata invalid}"
         return 1
     }
-    rm -rf "$work/dtb" "$work/verify"
+    charging_progress_elapsed "$prepare_started" \
+        "- 正在独立核验候选属性白名单、非目标内容、容器和 AVB"
+    charging_verify_candidate_semantics \
+        "$work/base.img" "$raw" "$output" "$CHARGING_PREPARED_SELECTED_COUNT" \
+        "$CHARGING_PREPARED_TOTAL_COUNT" "$work/semantic" || {
+        rm -rf "$work"
+        charging_fail "候选镜像独立语义校验失败；未持久化候选，也未写分区"
+        return 1
+    }
+    rm -rf "$work/dtb" "$work/verify" "$work/semantic"
     charging_progress_elapsed "$prepare_started" "- 正在同步并持久化离线准备事务"
     sync || {
         rm -rf "$work"
@@ -1866,13 +2908,28 @@ charging_prepare_requested() {
     }
     rm -rf "$old_dir"
     charging_progress_elapsed "$prepare_started" "- 正在复核持久化后的离线准备事务"
-    charging_prepared_load_dir "$CHARGING_PREPARED_DIR" || {
+    charging_prepared_load_dir "$CHARGING_PREPARED_DIR" 1 0 || {
         charging_discard_prepared
         charging_fail "持久化后的 DTBO 准备事务复核失败"
         return 1
     }
+    if [ "$CHARGING_PREPARED_PATCHED_HASH" = "$CHARGING_PREPARED_LIVE_HASH" ]; then
+        charging_discard_prepared || {
+            charging_fail "候选与手机当前 DTBO 相同，但无法清理无需写入的候选目录"
+            return 1
+        }
+        sync || {
+            charging_fail "无需写入的候选目录已删除，但文件系统同步失败"
+            return 1
+        }
+        CHARGING_PREPARE_OUTCOME=already-current
+        charging_progress_elapsed "$prepare_started" \
+            "- 已独立验证 $CHARGING_PREPARED_SELECTED_COUNT/$CHARGING_PREPARED_TOTAL_COUNT 个 DTBO 子镜像；手机当前 DTBO 已符合期望，无需写入，候选已清理"
+        return 0
+    fi
+    CHARGING_PREPARE_OUTCOME=candidate-ready
     charging_progress_elapsed "$prepare_started" \
-        "- 已离线验证 $CHARGING_PREPARED_SELECTED_COUNT/$CHARGING_PREPARED_TOTAL_COUNT 个 DTBO 子镜像；尚未写入分区"
+        "- 已独立验证 $CHARGING_PREPARED_SELECTED_COUNT/$CHARGING_PREPARED_TOTAL_COUNT 个 DTBO 子镜像；尚未写入分区"
     return 0
 }
 

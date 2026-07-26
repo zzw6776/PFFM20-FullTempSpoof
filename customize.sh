@@ -138,24 +138,19 @@ install_thermal_value_valid() {
         [ "$value" -le "$THERMAL_VALID_MAX_MILLI_C" ]
 }
 
-install_thermal_type_uses_celsius_unit() {
+install_thermal_type_is_non_temperature() {
     local type
     type="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
-    [ "$type" = socd ]
+    case "$type" in
+        socd|vbat|pm8550-bcl-lvl[0-2]|pmih010x-bcl-lvl[0-2]|pmih010x-ibat-lvl[01])
+            return 0
+            ;;
+    esac
+    return 1
 }
 
 install_thermal_value_valid_for_type() {
-    local type="$1" value="$2" min max
-    if ! install_thermal_type_uses_celsius_unit "$type"; then
-        install_thermal_value_valid "$value"
-        return $?
-    fi
-
-    [ "${THERMAL_VALUE_FILTER_ENABLE:-1}" = 1 ] || return 0
-    install_signed_int "$value" || return 1
-    min="$(install_valid_min_c)"
-    max="$(install_valid_max_c)"
-    [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]
+    install_thermal_value_valid "$2"
 }
 
 install_power_value_valid() {
@@ -202,7 +197,7 @@ install_service_mode_for() {
 }
 
 install_preflight() {
-    local zone count=0 unsupported=0 supported=0 invalid=0 context type real raw p service state mode
+    local zone count=0 unsupported=0 supported=0 invalid=0 excluded=0 context type real raw p service state mode
     local found_service=0 configured_service=0
     local min_c max_c
     INSTALL_SKIP_COUNT=0
@@ -226,7 +221,9 @@ install_preflight() {
         type="$(cat "$zone/type" 2>/dev/null | tr -d '\r\n')"
         [ -n "$type" ] || type=unknown
         raw="$(cat "$zone/temp" 2>/dev/null | tr -d ' \r\n')"
-        if ! install_context_supported "$context"; then
+        if install_thermal_type_is_non_temperature "$type"; then
+            excluded=$((excluded + 1))
+        elif ! install_context_supported "$context"; then
             unsupported=$((unsupported + 1))
             if [ "$unsupported" -le 5 ]; then
                 install_print_skip "${zone##*/} $type：SELinux 标签未适配 (${context:-unknown})"
@@ -251,7 +248,7 @@ install_preflight() {
             install_print_skip "thermal zone：当前 $count 个节点的 SELinux 标签均未适配，核心伪装不会生效"
         fi
     else
-        ui_print "  thermal zone：发现 $count 个，可处理 $supported 个，过滤跳过 $invalid 个"
+        ui_print "  thermal zone：发现 $count 个，可处理 $supported 个，过滤跳过 $invalid 个，非温度排除 $excluded 个"
     fi
     [ "$unsupported" -gt 5 ] && install_print_skip "另有 $((unsupported - 5)) 个 thermal zone 标签未适配，详见运行日志"
     [ "$invalid" -gt 5 ] && install_print_skip "另有 $((invalid - 5)) 个 thermal zone 当前值超出过滤范围，运行时跳过"
