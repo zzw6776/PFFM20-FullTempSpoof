@@ -1,0 +1,7 @@
+*.sh text eol=lf
+*.conf text eol=lf
+*.cells text eol=lf
+module.prop text eol=lf
+bin/* binary
+*.img binary
+*.zip binary
