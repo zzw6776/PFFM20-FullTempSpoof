@@ -45,6 +45,7 @@ for file in \
     post-fs-data.sh service.sh shell-bootstrap.sh uninstall.sh \
     tests/avb_container_android.sh tests/avb_prepare_android.sh \
     tests/bootstrap_android.sh tests/charging_transaction_android.sh \
+    tests/already_current_android.sh \
     tests/config_android.sh tests/cross_slot_restore_android.sh \
     tests/locking_android.sh tests/operation_state_guard_android.sh \
     tests/prepared_guard_android.sh tests/reboot_phase_android.sh \
@@ -61,28 +62,30 @@ suite_log "running=cross_slot_restore_android.sh"
 "$BB" sh "$ROOT/tests/cross_slot_restore_android.sh" "$SUITE_STATE/cross-slot" || exit 12
 suite_log "running=charging_transaction_android.sh"
 "$BB" sh "$ROOT/tests/charging_transaction_android.sh" "$SUITE_STATE/transaction" || exit 13
+suite_log "running=already_current_android.sh"
+"$BB" sh "$ROOT/tests/already_current_android.sh" "$SUITE_STATE/already-current" || exit 14
 suite_log "running=locking_android.sh"
-"$BB" sh "$ROOT/tests/locking_android.sh" "$SUITE_STATE/lock" || exit 14
+"$BB" sh "$ROOT/tests/locking_android.sh" "$SUITE_STATE/lock" || exit 15
 suite_log "running=reboot_phase_android.sh"
-"$BB" sh "$ROOT/tests/reboot_phase_android.sh" "$SUITE_STATE/reboot" || exit 15
+"$BB" sh "$ROOT/tests/reboot_phase_android.sh" "$SUITE_STATE/reboot" || exit 16
 suite_log "running=prepared_guard_android.sh"
-"$BB" sh "$ROOT/tests/prepared_guard_android.sh" "$SUITE_STATE/prepared" || exit 16
+"$BB" sh "$ROOT/tests/prepared_guard_android.sh" "$SUITE_STATE/prepared" || exit 17
 suite_log "running=operation_state_guard_android.sh"
-"$BB" sh "$ROOT/tests/operation_state_guard_android.sh" "$SUITE_STATE/operation-state" || exit 17
+"$BB" sh "$ROOT/tests/operation_state_guard_android.sh" "$SUITE_STATE/operation-state" || exit 18
 suite_log "running=avb_container_android.sh"
-"$BB" sh "$ROOT/tests/avb_container_android.sh" "$SUITE_STATE/avb-container" || exit 18
+"$BB" sh "$ROOT/tests/avb_container_android.sh" "$SUITE_STATE/avb-container" || exit 19
 suite_log "running=avb_prepare_android.sh"
 if [ -n "$PREPARED_REUSE_STATE" ]; then
-    "$BB" sh "$ROOT/tests/avb_prepare_android.sh" "$PREPARED_REUSE_STATE" reuse || exit 19
+    "$BB" sh "$ROOT/tests/avb_prepare_android.sh" "$PREPARED_REUSE_STATE" reuse || exit 20
 else
-    "$BB" sh "$ROOT/tests/avb_prepare_android.sh" "$SUITE_STATE/avb-prepare" || exit 19
+    "$BB" sh "$ROOT/tests/avb_prepare_android.sh" "$SUITE_STATE/avb-prepare" || exit 20
 fi
 
-after_hash="$(charging_sha256 "$part")" || exit 20
+after_hash="$(charging_sha256 "$part")" || exit 21
 echo "dtbo_after=$after_hash"
 [ "$before_hash" = "$after_hash" ] || {
     echo dtbo_partition_changed=unexpected
-    exit 21
+    exit 22
 }
 SUITE_SUCCESS=1
 suite_log "PJZ110 实机只读回归完成"

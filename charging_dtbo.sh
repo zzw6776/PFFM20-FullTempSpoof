@@ -2914,17 +2914,9 @@ charging_prepare_requested() {
         return 1
     }
     if [ "$CHARGING_PREPARED_PATCHED_HASH" = "$CHARGING_PREPARED_LIVE_HASH" ]; then
-        charging_discard_prepared || {
-            charging_fail "候选与手机当前 DTBO 相同，但无法清理无需写入的候选目录"
-            return 1
-        }
-        sync || {
-            charging_fail "无需写入的候选目录已删除，但文件系统同步失败"
-            return 1
-        }
         CHARGING_PREPARE_OUTCOME=already-current
         charging_progress_elapsed "$prepare_started" \
-            "- 已独立验证 $CHARGING_PREPARED_SELECTED_COUNT/$CHARGING_PREPARED_TOTAL_COUNT 个 DTBO 子镜像；手机当前 DTBO 已符合期望，无需写入，候选已清理"
+            "- 已独立验证 $CHARGING_PREPARED_SELECTED_COUNT/$CHARGING_PREPARED_TOTAL_COUNT 个 DTBO 子镜像；手机当前 DTBO 已符合期望，候选已保留并交由提交阶段收尾"
         return 0
     fi
     CHARGING_PREPARE_OUTCOME=candidate-ready
