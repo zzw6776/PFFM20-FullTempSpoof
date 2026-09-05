@@ -131,20 +131,17 @@ for power_path in /sys/class/power_supply/*/temp /sys/class/power_supply/*/tempe
     found_power_supply=1
     power_raw="$(cat "$power_path" 2>/dev/null | tr -d ' \r\n')"
     power_fake="$(power_supply_target_value "$power_path")"
-    case "${power_path#/sys/class/power_supply/}" in
-        mtk-battery/temperature)
+    if power_supply_uses_celsius_unit "$power_path"; then
+        power_real_c="$power_raw"
+        power_fake_c="$power_fake"
+    else
+        if [ -n "$power_raw" ] && [ "$power_raw" != "0" ] 2>/dev/null; then
+            power_real_c="$(awk "BEGIN { printf \"%.1f\", $power_raw / 10 }")"
+        else
             power_real_c="$power_raw"
-            power_fake_c="$power_fake"
-            ;;
-        *)
-            if [ -n "$power_raw" ] && [ "$power_raw" != "0" ] 2>/dev/null; then
-                power_real_c="$(awk "BEGIN { printf \"%.1f\", $power_raw / 10 }")"
-            else
-                power_real_c="$power_raw"
-            fi
-            power_fake_c="$(awk "BEGIN { printf \"%.1f\", $power_fake / 10 }")"
-            ;;
-    esac
+        fi
+        power_fake_c="$(awk "BEGIN { printf \"%.1f\", $power_fake / 10 }")"
+    fi
     if ! power_supply_value_valid "$power_path" "$power_raw"; then
         echo "  ${power_path#/sys/class/power_supply/}: 真实 ${power_real_c}°C [当前值不在正常温度范围，运行时跳过]"
     elif power_supply_target_enabled "$power_path"; then
@@ -156,7 +153,9 @@ done
 [ "$found_power_supply" = 1 ] || echo "  power_supply 温度节点：未发现"
 
 if [ -r /proc/shell-temp ]; then
-    if [ "$PROC_SHELL_TEMP_ENABLE" = 1 ]; then
+    if ! proc_shell_temp_supported; then
+        echo "  外壳 (/proc/shell-temp): [本机不适用，已忽略；未写入或清零]"
+    elif [ "$PROC_SHELL_TEMP_ENABLE" = 1 ]; then
         echo "  外壳 (/proc/shell-temp): -> 伪装 ${SHELL_SKIN_TEMP_C}°C"
     else
         echo "  外壳 (/proc/shell-temp): [配置为不伪装]"

@@ -20,6 +20,7 @@ PFFM_LEGACY_DIR_START="${PFFM_LEGACY_DIR_START:-}"
 PFFM_LEGACY_DIR_TARGET="${PFFM_LEGACY_DIR_TARGET:-}"
 PFFM_LEGACY_LOCK_BOOT_CLEANUP="${PFFM_LEGACY_LOCK_BOOT_CLEANUP:-0}"
 ORIGINAL_RUNTIME_FILE="$STATE_DIR/original-runtime.conf"
+TEMP_FD_CONSUMERS_FILE="$STATE_DIR/temp-fd-consumers.tsv"
 TAB="$(printf '\t')"
 
 mkdir -p "$STATE_DIR" 2>/dev/null
@@ -70,6 +71,7 @@ load_config() {
 
     POWER_SUPPLY_BATTERY_ENABLE=1
     PROC_SHELL_TEMP_ENABLE=1
+    AUTO_REFRESH_STALE_TEMP_FD_CONSUMERS=1
     HORAE_SERVICE_MODE=keep
     MTK_THERMAL_HAL_SERVICE_MODE=keep
     THERMAL_CORE_SERVICE_MODE=keep
@@ -113,6 +115,7 @@ validate_config() {
         BATTERY_ENABLE CHARGER_ENABLE PMIC_ENABLE DYNAMIC_RADIO_ENABLE MODEM_RF_ENABLE \
         CONNECTIVITY_ENABLE NTC_AMBIENT_ENABLE UNKNOWN_ENABLE \
         POWER_SUPPLY_BATTERY_ENABLE PROC_SHELL_TEMP_ENABLE \
+        AUTO_REFRESH_STALE_TEMP_FD_CONSUMERS \
         THERMAL_VALUE_FILTER_ENABLE CONFLICT_CHECK VERIFY_AFTER_APPLY \
         CHARGING_DTBO_ENABLE PPS55_ENABLE PD_QC_27W_ENABLE; do
         eval "value=\${$key}"
@@ -470,12 +473,13 @@ ensure_fake_root_for_context() {
 
 runtime_mounts_any_present() {
     local target source
-    [ -s "$MOUNTS_FILE" ] || return 1
-    while IFS="$TAB" read -r target source; do
-        [ -n "$target" ] || continue
-        is_exact_mountpoint "$target" && return 0
-    done < "$MOUNTS_FILE"
-    return 1
+    if [ -s "$MOUNTS_FILE" ]; then
+        while IFS="$TAB" read -r target source; do
+            [ -n "$target" ] || continue
+            is_exact_mountpoint "$target" && return 0
+        done < "$MOUNTS_FILE"
+    fi
+    runtime_tracked_mountpoints_present
 }
 
 expected_runtime_targets() {
@@ -514,7 +518,40 @@ mount_record_has_target() {
 }
 
 runtime_tracked_mountpoints() {
-    awk '$5 ~ /\/thermal_zone[0-9]+\/temp$/ || $5 ~ /\/power_supply\/.*\/temp$/ || $5 ~ /\/power_supply\/.*\/temperature$/ { print $5 }' /proc/self/mountinfo 2>/dev/null
+    # /sys/class/power_supply 是符号链接农场，bind 的真实目标通常位于厂商
+    # sysfs 路径，不能再靠目标路径中是否含有 power_supply 来识别。
+    # 每个伪造源都位于本模块独立创建的 context tmpfs；bind mount 与源
+    # tmpfs 具有相同 major:minor。先收集这些设备号，再列出同设备号且
+    # 不是 tmpfs 根本身的挂载，即可覆盖 thermal 与解析后的厂商路径。
+    awk -v prefix="$FAKE_ROOT/" '
+        {
+            device[NR] = $3
+            target[NR] = $5
+            if (index($5, prefix) == 1) {
+                fake_device[$3] = 1
+                fake_root[$5] = 1
+            }
+        }
+        END {
+            count = 0
+            for (i = 1; i <= NR; i++) {
+                if ((device[i] in fake_device) && !(target[i] in fake_root)) {
+                    candidate[++count] = target[i]
+                }
+            }
+            # 若未来出现目录级 bind，先卸载更深的目标，避免父挂载遮蔽子挂载。
+            for (i = 1; i <= count; i++) {
+                for (j = i + 1; j <= count; j++) {
+                    if (length(candidate[j]) > length(candidate[i])) {
+                        swap = candidate[i]
+                        candidate[i] = candidate[j]
+                        candidate[j] = swap
+                    }
+                }
+            }
+            for (i = 1; i <= count; i++) print candidate[i]
+        }
+    ' /proc/self/mountinfo 2>/dev/null
 }
 
 runtime_tracked_mountpoints_present() {
@@ -533,7 +570,7 @@ runtime_mounts_complete() {
         rm -f "$mountpoints_file" "$tracked_file" 2>/dev/null
         return 1
     }
-    awk '$0 ~ /\/thermal_zone[0-9]+\/temp$/ || $0 ~ /\/power_supply\/.*\/temp$/ || $0 ~ /\/power_supply\/.*\/temperature$/ { print }' "$mountpoints_file" > "$tracked_file" 2>/dev/null || {
+    runtime_tracked_mountpoints > "$tracked_file" 2>/dev/null || {
         rm -f "$mountpoints_file" "$tracked_file" 2>/dev/null
         return 1
     }
@@ -626,8 +663,9 @@ reconcile_runtime_state() {
         return $?
     fi
 
-    if [ -e "$ACTIVE_FILE" ] || [ -e "$MOUNTS_FILE" ]; then
+    if [ -e "$ACTIVE_FILE" ] || [ -e "$MOUNTS_FILE" ] || [ -s "$TEMP_FD_CONSUMERS_FILE" ]; then
         # bind mount 会在重启后自动消失；清除外置状态目录里的陈旧标记。
+        restore_temp_fd_consumers || return 1
         rm -f "$ACTIVE_FILE" "$MOUNTS_FILE" 2>/dev/null
         restore_fake_roots 2>/dev/null || true
         log INFO "检测到重启后的陈旧运行时标记，已清理"
@@ -821,8 +859,46 @@ power_supply_category() {
     esac
 }
 
+power_supply_uses_celsius_unit() {
+    local path="$1" driver_note usb_path
+    case "${path#/sys/class/power_supply/}" in
+        mtk-battery/temperature) return 0 ;;
+        usb/temp)
+            # 已核实的两代 oplus_chg_v2 都由 usb_psy_get_prop(TEMP)
+            # 原样返回 wired 摄氏度；按驱动身份识别，不按系统版本猜测。
+            # OPD2413 16.0.1.301 KO SHA-256:
+            # 0d3ad562548d7e1ee448e08fda2cd5b81ef9178f5a00879872de74128fe224d1
+            # PJZ110 15.0.0.851 KO SHA-256:
+            # 31e0e42f89d255528b5023aac814722505564b0fa3ce7a8c3f23a34f5f4ad87c
+            # 使用已加载模块的 Build ID 和实际节点归属，不按 ROM 名或读数量级猜单位。
+            driver_note="$(od -An -tx1 -v /sys/module/oplus_chg_v2/notes/.note.gnu.build-id 2>/dev/null | tr -d ' \r\n')"
+            case "$driver_note" in
+                040000001400000003000000474e5500163100694926f3225ff7dba1d604cdbffa735341|\
+                040000001400000003000000474e550065e532911e481652eaa2cfb03ec6231530b28fff) ;;
+                *) return 1 ;;
+            esac
+            usb_path="$(readlink -f /sys/class/power_supply/usb 2>/dev/null)"
+            [ "$usb_path" = /sys/devices/platform/soc/soc:oplus,mms_wired/oplus_mms/wired/usb ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+power_supply_verified_zero_is_mountable() {
+    local path="$1" value="$2"
+    [ "$value" = 0 ] || return 1
+    case "${path#/sys/class/power_supply/}" in
+        usb/temp)
+            # 已确认该路径确实导出整数摄氏度，因此即使当前暂时读到 0，
+            # 也可以安全预挂载；未知驱动或未知节点仍按普通无效值跳过。
+            power_supply_uses_celsius_unit "$path"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 power_supply_target_value() {
-    local path="$1" supply file node_type override_c category temp_c
+    local path="$1" node_type override_c category temp_c
     node_type="$(power_supply_node_type "$path")"
     if override_c="$(node_config_temp_c "$node_type")"; then
         temp_c="$override_c"
@@ -830,29 +906,25 @@ power_supply_target_value() {
         category="$(power_supply_category "$path")"
         temp_c="$(category_temp_c "$category")"
     fi
-    supply="${path#/sys/class/power_supply/}"
-    supply="${supply%%/*}"
-    file="${path##*/}"
-    case "$supply/$file" in
-        mtk-battery/temperature) printf '%s\n' "$temp_c" ;;
-        *) printf '%s\n' $((temp_c * 10)) ;;
-    esac
+    if power_supply_uses_celsius_unit "$path"; then
+        printf '%s\n' "$temp_c"
+    else
+        printf '%s\n' $((temp_c * 10))
+    fi
 }
 
 power_supply_value_valid() {
     local path="$1" value="$2" min max
     [ "${THERMAL_VALUE_FILTER_ENABLE:-1}" = 1 ] || return 0
     signed_int "$value" || return 1
-    case "${path#/sys/class/power_supply/}" in
-        mtk-battery/temperature)
-            min="$(valid_min_c)"
-            max="$(valid_max_c)"
-            ;;
-        *)
-            min="$(valid_min_deci_c)"
-            max="$(valid_max_deci_c)"
-            ;;
-    esac
+    power_supply_verified_zero_is_mountable "$path" "$value" && return 0
+    if power_supply_uses_celsius_unit "$path"; then
+        min="$(valid_min_c)"
+        max="$(valid_max_c)"
+    else
+        min="$(valid_min_deci_c)"
+        max="$(valid_max_deci_c)"
+    fi
     [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]
 }
 
@@ -927,6 +999,9 @@ apply_power_supply_charger() {
         fi
         value="$(power_supply_target_value "$target")"
         name="$(power_supply_source_name "$target")"
+        if power_supply_verified_zero_is_mountable "$target" "$raw"; then
+            log INFO "$target 当前读取为 0；节点类型、单位和驱动身份均已核实，允许预挂载"
+        fi
         if bind_fake_value "$target" "$name" "$value"; then
             mounted=$((mounted + 1))
             log INFO "$target 已伪装为 $value"
@@ -942,8 +1017,32 @@ apply_power_supply_charger() {
     return "$res"
 }
 
+proc_shell_temp_profile() {
+    local note
+    if [ ! -d /sys/module/horae_shell_temp ]; then
+        printf '%s\n' legacy-override
+        return 0
+    fi
+    note="$(od -An -v -tx1 /sys/module/horae_shell_temp/notes/.note.gnu.build-id 2>/dev/null | tr -d ' \r\n')"
+    case "$note" in
+        040000001400000003000000474e550076b97deb14e77e388f63ae6fc56fee1881862741)
+            # OPD2413 16.0.1.301：0～2 是温度发布槽，写 0 不会恢复真实温度。
+            printf '%s\n' horae-report-slots-3
+            ;;
+        *)
+            # 同名驱动的新实现未经核实，不回退到旧版写零恢复协议。
+            printf '%s\n' unknown-horae-shell
+            ;;
+    esac
+}
+
+proc_shell_temp_supported() {
+    [ "$(proc_shell_temp_profile)" = legacy-override ]
+}
+
 write_shell_temp() {
     local value="$1" i=0
+    proc_shell_temp_supported || return 1
     [ -w /proc/shell-temp ] || return 1
     while [ "$i" -le 7 ]; do
         printf '%s %s\n' "$i" "$value" > /proc/shell-temp 2>/dev/null || return 1
@@ -954,6 +1053,10 @@ write_shell_temp() {
 
 apply_proc_shell_temp() {
     [ "$PROC_SHELL_TEMP_ENABLE" = 1 ] || return 0
+    if ! proc_shell_temp_supported; then
+        log INFO "/proc/shell-temp 不是本机适用的旧版覆盖入口，已忽略：$(proc_shell_temp_profile)；未写入或清零"
+        return 0
+    fi
     local value=$((SHELL_SKIN_TEMP_C * 1000))
     if write_shell_temp "$value"; then
         log INFO "/proc/shell-temp 0～7 已设置为 ${SHELL_SKIN_TEMP_C}°C"
@@ -996,6 +1099,271 @@ service_mode_for() {
 
 service_exists() {
     [ -n "$(getprop init.svc."$1" 2>/dev/null)" ]
+}
+
+service_executable_for() {
+    local service="$1" rc executable
+    for rc in \
+        /system/etc/init/*.rc \
+        /system_ext/etc/init/*.rc \
+        /product/etc/init/*.rc \
+        /vendor/etc/init/*.rc \
+        /odm/etc/init/*.rc; do
+        [ -r "$rc" ] || continue
+        executable="$(awk -v wanted="$service" \
+            '$1 == "service" && $2 == wanted { print $3; exit }' "$rc" 2>/dev/null)"
+        if [ -n "$executable" ]; then
+            printf '%s\n' "$executable"
+            return 0
+        fi
+    done
+    return 1
+}
+
+service_process_pid() {
+    local service="$1" pid executable executable_real process_name process_executable matched_pid=
+    pid="$(getprop init.svc_debug_pid."$service" 2>/dev/null)"
+    case "$pid" in
+        ''|*[!0-9]*) ;;
+        *)
+            [ -d "/proc/$pid" ] && {
+                printf '%s\n' "$pid"
+                return 0
+            }
+            ;;
+    esac
+
+    executable="$(service_executable_for "$service")" || return 1
+    case "$executable" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    executable_real="$(readlink -f "$executable" 2>/dev/null)"
+    [ -n "$executable_real" ] || executable_real="$executable"
+    process_name="${executable_real##*/}"
+    case "$process_name" in
+        ''|sh|bash|dash|mksh|toybox|busybox) return 1 ;;
+    esac
+
+    for pid in $(pidof "$process_name" 2>/dev/null); do
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        process_executable="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+        if [ "$process_executable" = "$executable_real" ]; then
+            # 同一可执行文件可能承载多个 init 服务；候选不唯一时不能猜 PID。
+            [ -z "$matched_pid" ] || return 1
+            matched_pid="$pid"
+        fi
+    done
+    [ -n "$matched_pid" ] || return 1
+    printf '%s\n' "$matched_pid"
+    return 0
+}
+
+temp_fd_mount_state() {
+    local pid="$1" fd_link path fd_number fd_mount fd_flags current_mount
+    local tracked=0 current=0 stale=0
+    [ -d "/proc/$pid/fd" ] || return 1
+    [ -s "$MOUNTS_FILE" ] || return 1
+
+    for fd_link in /proc/"$pid"/fd/*; do
+        path="$(readlink "$fd_link" 2>/dev/null)"
+        fd_number="${fd_link##*/}"
+        case "$path" in
+            /sys/*/thermal_zone*/temp)
+                mount_record_has_target "$path" || continue
+                ;;
+            "$FAKE_ROOT"/*)
+                # bind 撤销后，仍打开的模块伪造文件可能直接显示为源路径或 deleted。
+                tracked=$((tracked + 1))
+                stale=$((stale + 1))
+                continue
+                ;;
+            /)
+                # 已卸载 tmpfs 中的打开文件在 /proc/PID/fd 中可能退化为“/”。
+                # 只接受只读普通句柄且其 mnt_id 已不在该进程 mountinfo 中的组合证据，
+                # 避免把正常根目录 FD 当成过期温度句柄。
+                fd_mount="$(awk '$1 == "mnt_id:" { print $2; exit }' \
+                    "/proc/$pid/fdinfo/$fd_number" 2>/dev/null)"
+                fd_flags="$(awk '$1 == "flags:" { print $2; exit }' \
+                    "/proc/$pid/fdinfo/$fd_number" 2>/dev/null)"
+                [ "$fd_flags" = 0400000 ] || continue
+                [ -n "$fd_mount" ] || continue
+                if ! awk -v wanted="$fd_mount" \
+                    '$1 == wanted { found=1 } END { exit !found }' \
+                    "/proc/$pid/mountinfo" 2>/dev/null; then
+                    tracked=$((tracked + 1))
+                    stale=$((stale + 1))
+                fi
+                continue
+                ;;
+            *) continue ;;
+        esac
+        tracked=$((tracked + 1))
+        fd_mount="$(awk '$1 == "mnt_id:" { print $2; exit }' \
+            "/proc/$pid/fdinfo/$fd_number" 2>/dev/null)"
+        current_mount="$(awk -v wanted="$path" \
+            '$5 == wanted { print $1; exit }' "/proc/$pid/mountinfo" 2>/dev/null)"
+        if [ -n "$fd_mount" ] && [ "$fd_mount" = "$current_mount" ]; then
+            current=$((current + 1))
+        else
+            stale=$((stale + 1))
+        fi
+    done
+    printf '%s\t%s\t%s\n' "$tracked" "$current" "$stale"
+    return 0
+}
+
+record_temp_fd_consumer() {
+    local service="$1" boot_id
+    case "$service" in
+        ''|*[!A-Za-z0-9_.-]*) return 1 ;;
+    esac
+    boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d ' \r\n')"
+    [ -n "$boot_id" ] || return 1
+    if [ -s "$TEMP_FD_CONSUMERS_FILE" ] && \
+        awk -v FS="$TAB" -v wanted_service="$service" -v wanted_boot="$boot_id" \
+            '$1 == wanted_service && $2 == wanted_boot { found=1 } END { exit !found }' \
+            "$TEMP_FD_CONSUMERS_FILE" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\t%s\n' "$service" "$boot_id" >> "$TEMP_FD_CONSUMERS_FILE" || return 1
+    chmod 0600 "$TEMP_FD_CONSUMERS_FILE" 2>/dev/null
+    return 0
+}
+
+auto_refresh_temp_fd_service_candidates() {
+    # 只处理已确认会长期缓存 thermal_zone/temp FD 的引擎；
+    # Horae 与 Thermal HAL 不在自动重启范围内。
+    printf '%s\n' thermal-engine qti.thermal-engine
+}
+
+refresh_stale_temp_fd_consumers() {
+    [ "$AUTO_REFRESH_STALE_TEMP_FD_CONSUMERS" = 1 ] || {
+        log INFO "过期温度 FD 消费者自动刷新已关闭"
+        return 0
+    }
+
+    local service mode pid state tracked current stale tries result=0
+    for service in $(auto_refresh_temp_fd_service_candidates); do
+        service_exists "$service" || continue
+        mode="$(service_mode_for "$service")"
+        [ "$mode" = keep ] || {
+            log INFO "服务 $service 已配置为 $mode，跳过自动 FD 刷新"
+            continue
+        }
+        [ "$(getprop init.svc."$service" 2>/dev/null)" = running ] || {
+            log INFO "服务 $service 当前未运行，不需要刷新温度 FD"
+            continue
+        }
+        pid="$(service_process_pid "$service")" || {
+            log WARN "服务 $service 正在运行，但无法从 init rc 动态解析唯一进程，跳过温度 FD 刷新"
+            result=1
+            continue
+        }
+        state="$(temp_fd_mount_state "$pid")" || {
+            log WARN "服务 $service 无法核对温度 FD 挂载状态，跳过自动刷新"
+            result=1
+            continue
+        }
+        IFS="$TAB" read -r tracked current stale <<EOF
+$state
+EOF
+        if [ "$tracked" -eq 0 ]; then
+            log INFO "服务 $service 未持有本模块已挂载的温度路径 FD，无需刷新"
+            continue
+        fi
+        record_temp_fd_consumer "$service" || {
+            log WARN "记录服务 $service 的温度 FD 恢复状态失败，拒绝自动重启"
+            result=1
+            continue
+        }
+        if [ "$stale" -eq 0 ] && [ "$current" -eq "$tracked" ]; then
+            log INFO "服务 $service 的 $current 个温度 FD 已指向当前挂载，无需重启"
+            continue
+        fi
+
+        log INFO "服务 $service 检测到过期温度 FD：tracked=$tracked current=$current stale=$stale，开始一次受控重启"
+        restart_init_service "$service" || {
+            log ERROR "服务 $service 重启失败，保留恢复记录"
+            result=1
+            continue
+        }
+
+        tries=0
+        while [ "$tries" -lt 10 ]; do
+            pid="$(service_process_pid "$service")" || pid=
+            if [ -n "$pid" ]; then
+                state="$(temp_fd_mount_state "$pid")" || state=
+                if [ -n "$state" ]; then
+                    IFS="$TAB" read -r tracked current stale <<EOF
+$state
+EOF
+                    if [ "$tracked" -gt 0 ] && [ "$stale" -eq 0 ] && [ "$current" -eq "$tracked" ]; then
+                        log INFO "服务 $service 温度 FD 已刷新：pid=$pid current=$current stale=$stale"
+                        break
+                    fi
+                fi
+            fi
+            sleep 1
+            tries=$((tries + 1))
+        done
+        if [ "$tracked" -le 0 ] || [ "$stale" -ne 0 ] || [ "$current" -ne "$tracked" ]; then
+            log ERROR "服务 $service 重启后温度 FD 验证失败：pid=$pid tracked=$tracked current=$current stale=$stale"
+            result=1
+        fi
+    done
+    return "$result"
+}
+
+restore_temp_fd_consumers() {
+    [ -s "$TEMP_FD_CONSUMERS_FILE" ] || return 0
+
+    local current_boot service recorded_boot state result=0
+    current_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d ' \r\n')"
+    [ -n "$current_boot" ] || {
+        log ERROR "无法读取 boot_id，保留温度 FD 消费者恢复记录"
+        return 1
+    }
+
+    while IFS="$TAB" read -r service recorded_boot; do
+        case "$service" in
+            ''|*[!A-Za-z0-9_.-]*)
+                log ERROR "温度 FD 消费者恢复记录中的服务名无效：$service"
+                result=1
+                continue
+                ;;
+        esac
+        [ -n "$recorded_boot" ] || {
+            log ERROR "温度 FD 消费者恢复记录缺少 boot_id：$service"
+            result=1
+            continue
+        }
+        if [ "$recorded_boot" != "$current_boot" ]; then
+            log INFO "服务 $service 的温度 FD 恢复记录属于旧启动，当前进程不再持有旧挂载"
+            continue
+        fi
+
+        state="$(getprop init.svc."$service" 2>/dev/null)"
+        case "$state" in
+            running)
+                log INFO "温度挂载已撤销，重启服务 $service 以释放伪装文件句柄"
+                restart_init_service "$service" || result=1
+                ;;
+            stopped)
+                log INFO "服务 $service 已停止，不再持有伪装文件句柄"
+                ;;
+            '')
+                log INFO "服务 $service 已不存在，不需要恢复温度 FD"
+                ;;
+            *)
+                log ERROR "服务 $service 状态异常，保留温度 FD 恢复记录：$state"
+                result=1
+                ;;
+        esac
+    done < "$TEMP_FD_CONSUMERS_FILE"
+
+    [ "$result" -eq 0 ] && rm -f "$TEMP_FD_CONSUMERS_FILE"
+    return "$result"
 }
 
 service_actions_configured() {
@@ -1137,12 +1505,14 @@ restart_init_service() {
         log WARN "服务 $service 不存在，跳过重启"
         return 0
     }
-    before_pid="$(getprop init.svc_debug_pid."$service")"
+    before_pid="$(service_process_pid "$service" 2>/dev/null)"
+    [ -n "$before_pid" ] || before_pid="$(getprop init.svc_debug_pid."$service")"
     setprop ctl.restart "$service" 2>/dev/null || return 1
     while [ "$tries" -lt 5 ]; do
         sleep 1
         state="$(getprop init.svc."$service")"
-        after_pid="$(getprop init.svc_debug_pid."$service")"
+        after_pid="$(service_process_pid "$service" 2>/dev/null)"
+        [ -n "$after_pid" ] || after_pid="$(getprop init.svc_debug_pid."$service")"
         if [ "$state" = running ] && [ -z "$after_pid" ]; then
             log WARN "服务 $service 已运行，但无法读取 debug pid；按 best-effort 视为重启完成"
             return 0
@@ -1307,6 +1677,9 @@ apply_runtime() {
     apply_proc_shell_temp || {
         log WARN "/proc/shell-temp 应用失败，已跳过该入口"
     }
+    refresh_stale_temp_fd_consumers || {
+        log WARN "持有过期温度 FD 的消费者未完全刷新，已继续保留成功挂载"
+    }
     apply_private_services || {
         log WARN "厂商私有温控服务未完全按配置切换，已继续保留成功挂载"
     }
@@ -1443,6 +1816,18 @@ restore_runtime_services() {
     return "$result"
 }
 
+restore_proc_shell_temp() {
+    [ -e /proc/shell-temp ] || return 0
+    if ! proc_shell_temp_supported; then
+        log INFO "/proc/shell-temp 本机不适用，跳过旧版写零恢复：$(proc_shell_temp_profile)"
+        return 0
+    fi
+    write_shell_temp 0 || {
+        log ERROR "/proc/shell-temp 恢复失败"
+        return 1
+    }
+}
+
 restore_runtime() {
     local result=0 mounts_restored=0 force_service_restart=0
     if restore_mounts; then
@@ -1452,10 +1837,15 @@ restore_runtime() {
     else
         result=1
     fi
-    if [ -e /proc/shell-temp ] && ! write_shell_temp 0; then
-        log ERROR "/proc/shell-temp 恢复失败"
-        result=1
+    if [ -s "$TEMP_FD_CONSUMERS_FILE" ]; then
+        if runtime_mounts_any_present || thermal_target_mounts_present; then
+            log ERROR "温度挂载尚未全部撤销，保留消费者恢复记录并推迟服务重启"
+            result=1
+        else
+            restore_temp_fd_consumers || result=1
+        fi
     fi
+    restore_proc_shell_temp || result=1
     restore_runtime_services "$force_service_restart" || result=1
     if [ "$result" -eq 0 ]; then
         log INFO "运行时状态已恢复"

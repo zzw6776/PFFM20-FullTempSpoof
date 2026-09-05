@@ -23,6 +23,7 @@ else
     # Fallback：common.sh 不可读时，仍按固定路径清理所有运行时资源。
     MOUNTS_FILE="$STATE_DIR/mounts.tsv"
     ORIGINAL_RUNTIME_FILE="$STATE_DIR/original-runtime.conf"
+    TEMP_FD_CONSUMERS_FILE="$STATE_DIR/temp-fd-consumers.tsv"
     TAB="$(printf '\t')"
     LAZY_UNMOUNT_USED=0
 
@@ -40,6 +41,37 @@ else
         umount -l "$target" 2>/dev/null || return 1
         LAZY_UNMOUNT_USED=1
         ! is_exact_mountpoint_fallback "$target"
+    }
+
+    runtime_mountpoints_fallback() {
+        awk -v prefix="$FAKE_ROOT/" '
+            {
+                device[NR] = $3
+                target[NR] = $5
+                if (index($5, prefix) == 1) {
+                    fake_device[$3] = 1
+                    fake_root[$5] = 1
+                }
+            }
+            END {
+                count = 0
+                for (i = 1; i <= NR; i++) {
+                    if ((device[i] in fake_device) && !(target[i] in fake_root)) {
+                        candidate[++count] = target[i]
+                    }
+                }
+                for (i = 1; i <= count; i++) {
+                    for (j = i + 1; j <= count; j++) {
+                        if (length(candidate[j]) > length(candidate[i])) {
+                            swap = candidate[i]
+                            candidate[i] = candidate[j]
+                            candidate[j] = swap
+                        }
+                    }
+                }
+                for (i = 1; i <= count; i++) print candidate[i]
+            }
+        ' /proc/self/mountinfo 2>/dev/null
     }
 
     stop_service_fallback() {
@@ -81,6 +113,47 @@ else
             tries=$((tries + 1))
         done
         return 1
+    }
+
+    restore_temp_fd_consumers_fallback() {
+        [ -s "$TEMP_FD_CONSUMERS_FILE" ] || return 0
+
+        current_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d ' \r\n')"
+        [ -n "$current_boot" ] || return 1
+
+        restore_thermal_engine=0
+        restore_qti_thermal_engine=0
+        while IFS="$TAB" read -r service recorded_boot extra; do
+            [ -z "$extra" ] || return 1
+            case "$service" in
+                thermal-engine)
+                    [ -n "$recorded_boot" ] || return 1
+                    [ "$recorded_boot" = "$current_boot" ] && restore_thermal_engine=1
+                    ;;
+                qti.thermal-engine)
+                    [ -n "$recorded_boot" ] || return 1
+                    [ "$recorded_boot" = "$current_boot" ] && restore_qti_thermal_engine=1
+                    ;;
+                *) return 1 ;;
+            esac
+        done < "$TEMP_FD_CONSUMERS_FILE"
+
+        consumer_result=0
+        for service in thermal-engine qti.thermal-engine; do
+            case "$service" in
+                thermal-engine) [ "$restore_thermal_engine" = 1 ] || continue ;;
+                qti.thermal-engine) [ "$restore_qti_thermal_engine" = 1 ] || continue ;;
+            esac
+            state="$(getprop init.svc."$service" 2>/dev/null)"
+            case "$state" in
+                running) restart_service_fallback "$service" || consumer_result=1 ;;
+                stopped|'') ;;
+                *) consumer_result=1 ;;
+            esac
+        done
+
+        [ "$consumer_result" -eq 0 ] && rm -f "$TEMP_FD_CONSUMERS_FILE"
+        return "$consumer_result"
     }
 
     restore_service_state_fallback() {
@@ -157,25 +230,44 @@ else
         return "$service_result"
     }
 
+    mount_result=0
     if [ -f "$MOUNTS_FILE" ]; then
         while IFS="$TAB" read -r target source; do
             [ -n "$target" ] && [ -n "$source" ] || {
-                result=1
+                mount_result=1
                 continue
             }
-            unmount_exact_fallback "$target" || result=1
+            unmount_exact_fallback "$target" || mount_result=1
         done < "$MOUNTS_FILE"
-        [ "$result" -ne 0 ] || rm -f "$MOUNTS_FILE"
     fi
+
+    residual_list="$STATE_DIR/uninstall-residual-mounts.$$"
+    runtime_mountpoints_fallback > "$residual_list" 2>/dev/null
+    while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        unmount_exact_fallback "$target" || mount_result=1
+    done < "$residual_list"
+    rm -f "$residual_list" 2>/dev/null
+    runtime_mountpoints_fallback | awk 'NF { found=1; exit } END { exit !found }' && mount_result=1
+    [ "$mount_result" -ne 0 ] || rm -f "$MOUNTS_FILE"
+    [ "$mount_result" -eq 0 ] || result=1
 
     for dir in "$FAKE_ROOT"/*; do
         [ -d "$dir" ] || continue
         if ! unmount_exact_fallback "$dir"; then
+            mount_result=1
             result=1
         fi
     done
 
-    if [ -w /proc/shell-temp ]; then
+    if [ "$mount_result" -eq 0 ]; then
+        restore_temp_fd_consumers_fallback || result=1
+    else
+        result=1
+    fi
+
+    # common.sh 缺失时也不得将 Horae 温度发布槽清零；未知同名驱动同样不试写。
+    if [ -w /proc/shell-temp ] && [ ! -d /sys/module/horae_shell_temp ]; then
         i=0
         while [ "$i" -le 7 ]; do
             printf '%s %s\n' "$i" 0 > /proc/shell-temp 2>/dev/null || result=1

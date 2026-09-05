@@ -153,20 +153,44 @@ install_thermal_value_valid_for_type() {
     install_thermal_value_valid "$2"
 }
 
+install_power_uses_celsius_unit() {
+    local path="$1" driver_note usb_path
+    case "${path#/sys/class/power_supply/}" in
+        mtk-battery/temperature) return 0 ;;
+        usb/temp)
+            driver_note="$(od -An -tx1 -v /sys/module/oplus_chg_v2/notes/.note.gnu.build-id 2>/dev/null | tr -d ' \r\n')"
+            case "$driver_note" in
+                040000001400000003000000474e5500163100694926f3225ff7dba1d604cdbffa735341|\
+                040000001400000003000000474e550065e532911e481652eaa2cfb03ec6231530b28fff) ;;
+                *) return 1 ;;
+            esac
+            usb_path="$(readlink -f /sys/class/power_supply/usb 2>/dev/null)"
+            [ "$usb_path" = /sys/devices/platform/soc/soc:oplus,mms_wired/oplus_mms/wired/usb ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+install_power_verified_zero_is_mountable() {
+    [ "$2" = 0 ] || return 1
+    case "${1#/sys/class/power_supply/}" in
+        usb/temp) install_power_uses_celsius_unit "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
 install_power_value_valid() {
     local path="$1" value="$2" min max
     [ "${THERMAL_VALUE_FILTER_ENABLE:-1}" = 1 ] || return 0
     install_signed_int "$value" || return 1
-    case "${path#/sys/class/power_supply/}" in
-        mtk-battery/temperature)
-            min="$(install_valid_min_c)"
-            max="$(install_valid_max_c)"
-            ;;
-        *)
-            min="$(install_valid_min_deci_c)"
-            max="$(install_valid_max_deci_c)"
-            ;;
-    esac
+    install_power_verified_zero_is_mountable "$path" "$value" && return 0
+    if install_power_uses_celsius_unit "$path"; then
+        min="$(install_valid_min_c)"
+        max="$(install_valid_max_c)"
+    else
+        min="$(install_valid_min_deci_c)"
+        max="$(install_valid_max_deci_c)"
+    fi
     [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]
 }
 
@@ -264,8 +288,12 @@ install_preflight() {
         install_check_file_target "$p" "power_supply ${p#/sys/class/power_supply/}"
     done
 
-    if [ "$PROC_SHELL_TEMP_ENABLE" = 1 ] && [ ! -w /proc/shell-temp ]; then
-        install_print_skip "/proc/shell-temp：不存在或不可写"
+    if [ "$PROC_SHELL_TEMP_ENABLE" = 1 ]; then
+        if ! proc_shell_temp_supported; then
+            install_print_skip "/proc/shell-temp：本机不适用（$(proc_shell_temp_profile)），不会写入或清零"
+        elif [ ! -w /proc/shell-temp ]; then
+            install_print_skip "/proc/shell-temp：不存在或不可写"
+        fi
     fi
 
     for service in $(install_thermal_service_candidates); do
