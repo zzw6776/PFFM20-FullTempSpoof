@@ -1,6 +1,13 @@
 #!/system/bin/sh
 
-# 这里只准备持久状态目录，不在 post-fs-data 阶段挂载温度节点。
-# ColorOS 设备的 thermal zone 会在 late_start service 阶段就绪后一次性挂载。
-mkdir -p /data/adb/coloros_fulltempspoof 2>/dev/null
-chmod 0700 /data/adb/coloros_fulltempspoof 2>/dev/null
+MODDIR="${0%/*}"
+. "$MODDIR/common.sh"
+. "$MODDIR/sync-pif-security-patch.sh"
+
+# 温度节点仍只在 late_start service 阶段就绪后挂载；这里只处理必须早于 Zygote
+# 生效的可选安全补丁属性同步。
+log INFO "========== post-fs-data start =========="
+sync_pif_security_patch post-fs-data
+result=$?
+log INFO "post-fs-data end: patch_result=$result"
+exit "$result"

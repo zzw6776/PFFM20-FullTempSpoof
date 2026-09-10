@@ -55,6 +55,51 @@ preserve_existing_config() {
     return 0
 }
 
+migrate_legacy_patch_sync_state() {
+    local legacy_dir="/data/adb/pffm20_120hz_rr_override"
+    local legacy_flag="$legacy_dir/pif-security-patch-sync.enabled"
+    local legacy_applied="$legacy_dir/pif-security-patch-sync.applied"
+    local current_flag="$STATE_DIR/pif-security-patch-sync.enabled"
+    local current_applied="$STATE_DIR/pif-security-patch-sync.applied"
+    local pending="$current_flag.pending"
+
+    [ -e "$legacy_flag" ] || [ -e "$legacy_applied" ] || return 0
+
+    if [ -e "$legacy_flag" ]; then
+        [ -f "$legacy_flag" ] && [ -r "$legacy_flag" ] || return 1
+        if [ -e "$current_flag" ]; then
+            [ -f "$current_flag" ] && cmp -s "$legacy_flag" "$current_flag" || {
+                ui_print "! 新旧 PIF 补丁同步开关备份不一致，拒绝覆盖"
+                return 1
+            }
+        else
+            rm -f "$pending" 2>/dev/null
+            cp -p "$legacy_flag" "$pending" || return 1
+            chown 0:0 "$pending" 2>/dev/null || return 1
+            chmod 0600 "$pending" 2>/dev/null || return 1
+            restorecon "$pending" >/dev/null 2>&1 || true
+            cmp -s "$legacy_flag" "$pending" || return 1
+            mv -f "$pending" "$current_flag" || return 1
+        fi
+    fi
+
+    if [ -e "$legacy_applied" ]; then
+        [ -f "$legacy_applied" ] && [ -r "$legacy_applied" ] || return 1
+        if [ ! -e "$current_applied" ]; then
+            cp -p "$legacy_applied" "$current_applied" || return 1
+            chown 0:0 "$current_applied" 2>/dev/null || return 1
+            chmod 0600 "$current_applied" 2>/dev/null || return 1
+            restorecon "$current_applied" >/dev/null 2>&1 || true
+            cmp -s "$legacy_applied" "$current_applied" || return 1
+        fi
+    fi
+
+    sync
+    rm -f "$legacy_flag" "$legacy_applied" 2>/dev/null || return 1
+    ui_print "- 已把 PIF 补丁同步状态从旧 120Hz 模块迁移到本模块"
+    return 0
+}
+
 install_context_supported() {
     case "$1" in
         u:object_r:sysfs_therm:s0|\
@@ -337,6 +382,11 @@ fi
 
 if ! preserve_existing_config; then
     ui_print "! 保留上一版本 config.conf 失败，安装已中止"
+    abort
+fi
+
+if ! migrate_legacy_patch_sync_state; then
+    ui_print "! 迁移旧 PIF 补丁同步状态失败，安装已中止；旧备份未删除"
     abort
 fi
 

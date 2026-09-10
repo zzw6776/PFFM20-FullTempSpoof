@@ -1,6 +1,7 @@
 # ColorOS Full Temperature Spoof
 
-面向 ColorOS 的动态温度读数伪装模块，并为 PJZ110 Android 15 提供受限的充电 DTBO 扩展。
+面向 ColorOS 的动态温度读数伪装模块，提供可选的 PIF 安全补丁日期同步，并为 PJZ110
+Android 15 提供受限的充电 DTBO 扩展。
 
 温度伪装功能不绑定具体机型、Android 版本、内核版本或 SoC 平台；运行时会自动枚举当前设备实际存在的
 thermal zone、power_supply 温度节点和厂商温控服务，并按 `config.conf` 进行 best-effort 处理。
@@ -20,6 +21,30 @@ Android 15（SDK 35），并且只修改 DTBO 中 `oplus,project-id=0x5d0d` 的 
 6. 可选处理电池 power_supply 温度与 `/proc/shell-temp`。
 7. 厂商温控服务按单独配置项处理；默认全部 `keep`，不停止、不重启。
 8. 验证每个节点并生成映射表后退出，不驻留后台。
+
+## 可选 PIF 安全补丁日期同步
+
+PreventSubpageRestore 可在“TEE 证明管理 → 系统补丁日期统一”中启用“跟随 Play Integrity
+Fork”。开关默认关闭；启用后会在仅 Root 可读的状态目录创建：
+
+```text
+/data/adb/coloros_fulltempspoof/pif-security-patch-sync.enabled
+```
+
+模块在 `post-fs-data` 阶段按 Play Integrity Fork v18 的活动配置优先级检查
+`custom.pif.prop`、`custom.pif.json`、`pif.prop`、`pif.json`。当前只接受 prop 格式，并要求
+`SECURITY_PATCH` 与 `*.security_patch` 各出现一次、值完全相同且为有效 `YYYY-MM-DD` 日期；
+校验通过后使用 `resetprop -n` 同步：
+
+```text
+ro.build.version.security_patch
+ro.vendor.build.security_patch
+```
+
+日期不会写死，PIF 配置变化后会在下次重启时重新读取。缺少或停用 PIF、活动配置为 JSON、
+字段缺失/重复/不一致、日期无效或缺少 `resetprop` 时会停止同步并写入 `module.log`。
+从曾包含该功能的旧 120Hz 模块升级时，安装器会把现有开关备份和已应用状态迁移到本模块，
+确认复制一致后才删除旧状态文件。
 
 安装模块时不会读取或刷写 DTBO。安装完成后可先在 App 的充电控制页点击
 “建立原始备份”：该动作只读 A/B DTBO，在哈希与项目内保存的 PJZ110 A77
